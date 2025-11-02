@@ -1,6 +1,6 @@
-import gleam/bit_array
-import gleam/int
+import frame
 import gleam/list
+import gleam/option.{None, Some}
 import gleeunit
 import websocks
 
@@ -18,22 +18,6 @@ pub fn compute_accept_test() {
   let expected_accept = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
 
   assert websocks.compute_accept(websocket_key) == expected_accept
-}
-
-pub fn decode_basic_frame_test() {
-  let frame = <<
-    1:size(1),
-    0:size(1),
-    0:size(1),
-    0:size(1),
-    0:size(4),
-    0:size(1),
-    127:size(7),
-    256:size(64),
-    12:size(4),
-  >>
-
-  echo websocks.decode_frame(frame)
 }
 
 pub fn mask_simple_test() {
@@ -61,4 +45,179 @@ pub fn mask_repeatedly_test() {
     })
 
   assert result == unmasked
+}
+
+pub fn decode_complete_text_unmasked_frame_test() {
+  let payload = <<"Hello, Joe!":utf8>>
+
+  let decoded_frame =
+    frame.construct(
+      fin: True,
+      rsv1: False,
+      rsv2: False,
+      rsv3: False,
+      opcode: frame.Text,
+      mask: None,
+      payload:,
+    )
+    |> websocks.decode_frame()
+
+  assert decoded_frame
+    == Ok(#(websocks.Complete(websocks.Text(payload:)), <<>>))
+}
+
+pub fn decode_complete_text_masked_frame_test() {
+  let payload = <<"Hello, Joe!":utf8>>
+
+  let decoded_frame =
+    frame.construct(
+      fin: True,
+      rsv1: False,
+      rsv2: False,
+      rsv3: False,
+      opcode: frame.Text,
+      mask: Some(<<0x37, 0xfa, 0x21, 0x3d>>),
+      payload:,
+    )
+    |> websocks.decode_frame()
+
+  assert decoded_frame
+    == Ok(#(websocks.Complete(websocks.Text(payload:)), <<>>))
+}
+
+pub fn decode_incomplete_text_continuation_unmasked_frame_test() {
+  let payload = <<"Hello, Joe!":utf8>>
+
+  let decoded_frame =
+    frame.construct(
+      fin: False,
+      rsv1: False,
+      rsv2: False,
+      rsv3: False,
+      opcode: frame.Continuation,
+      mask: None,
+      payload:,
+    )
+    |> websocks.decode_frame()
+
+  assert decoded_frame
+    == Ok(#(websocks.Incomplete(websocks.Continuation(payload:)), <<>>))
+}
+
+pub fn decode_need_more_data_test() {
+  let decoded_frame = websocks.decode_frame(frame.unfinished_frame)
+  assert decoded_frame == Error(websocks.NotEnoughData(frame.unfinished_frame))
+}
+
+pub fn decode_invalid_frame_test() {
+  let decoded_frame = websocks.decode_frame(frame.invalid_opcode_frame)
+  assert decoded_frame == Error(websocks.InvalidFrame)
+}
+
+pub fn decode_ping_frame_test() {
+  let payload = <<"Hello, Joe!":utf8>>
+
+  let decoded_frame =
+    frame.construct(
+      fin: True,
+      rsv1: False,
+      rsv2: False,
+      rsv3: False,
+      opcode: frame.Ping,
+      mask: None,
+      payload:,
+    )
+    |> websocks.decode_frame()
+
+  assert decoded_frame
+    == Ok(#(websocks.Complete(websocks.Ping(payload:)), <<>>))
+}
+
+pub fn decode_normal_close_frame_test() {
+  let data = <<"Hello, Joe!":utf8>>
+  let payload = <<1000:size(16), data:bits>>
+
+  let decoded_frame =
+    frame.construct(
+      fin: True,
+      rsv1: False,
+      rsv2: False,
+      rsv3: False,
+      opcode: frame.Close,
+      mask: None,
+      payload:,
+    )
+    |> websocks.decode_frame()
+
+  assert decoded_frame
+    == Ok(
+      #(websocks.Complete(websocks.Close(websocks.NormalClosure(data:))), <<>>),
+    )
+}
+
+pub fn decode_custom_close_code_frame_test() {
+  let code = 4180
+  let data = <<"Hello, Joe!":utf8>>
+  let payload = <<code:size(16), data:bits>>
+
+  let decoded_frame =
+    frame.construct(
+      fin: True,
+      rsv1: False,
+      rsv2: False,
+      rsv3: False,
+      opcode: frame.Close,
+      mask: None,
+      payload:,
+    )
+    |> websocks.decode_frame()
+
+  assert decoded_frame
+    == Ok(
+      #(
+        websocks.Complete(
+          websocks.Close(websocks.CustomCloseCode(code:, data:)),
+        ),
+        <<>>,
+      ),
+    )
+}
+
+pub fn decode_frame_with_leftover_data_test() {
+  let payload = <<"Hello, ":utf8>>
+  let next_payload = <<"Joe!":utf8>>
+
+  let frame =
+    frame.construct(
+      fin: False,
+      rsv1: False,
+      rsv2: False,
+      rsv3: False,
+      opcode: frame.Text,
+      mask: None,
+      payload:,
+    )
+
+  let next_frame =
+    frame.construct(
+      fin: True,
+      rsv1: False,
+      rsv2: False,
+      rsv3: False,
+      opcode: frame.Continuation,
+      mask: None,
+      payload: next_payload,
+    )
+
+  let assert Ok(#(
+    websocks.Incomplete(websocks.Text(decoded_payload)),
+    next_frame,
+  )) = websocks.decode_frame(<<frame:bits, next_frame:bits>>)
+  assert decoded_payload == payload
+
+  let assert Ok(#(
+    websocks.Complete(websocks.Continuation(decoded_payload)),
+    <<>>,
+  )) = websocks.decode_frame(next_frame)
+  assert decoded_payload == next_payload
 }
