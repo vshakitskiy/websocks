@@ -3,6 +3,7 @@
 
 import gleam/bit_array
 import gleam/crypto
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
@@ -10,7 +11,7 @@ import gleam/string
 pub const magic_string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 pub fn compute_accept(key: String) -> String {
-  string.concat([key, magic_string])
+  string.append(key, magic_string)
   |> bit_array.from_string()
   |> crypto.hash(crypto.Sha1, _)
   |> bit_array.base64_encode(True)
@@ -336,4 +337,79 @@ pub fn encode_close_frame(
   masking masking: Option(BitArray),
 ) -> BitArray {
   encode_frame(Close(reason:), final: True, masking:)
+}
+
+pub type ResolveError {
+  NotUtf8
+  OrphanedContinuation
+  ControlFrameFragmented
+  FragmentationInterrupted
+  ConcurrentFragmentation
+}
+
+pub opaque type Context {
+  Empty
+  Accumulating(
+    frame_builder: fn(BitArray) -> Frame,
+    accumulated_payload: BitArray,
+  )
+}
+
+pub fn resolve_fragments(decoded_frames: List(DecodedFrame), context: Context) {
+  do_resolve_fragments(decoded_frames, context, [])
+}
+
+fn do_resolve_fragments(
+  decoded_frames: List(DecodedFrame),
+  context: Context,
+  resolved: List(Frame),
+) {
+  case decoded_frames, context {
+    // No more frames to process.
+    [], context -> Ok(#(list.reverse(resolved), context))
+
+    // FIN=1 text frames must be UTF-8.
+    [Complete(Text(payload:)), ..rest], Empty -> {
+      case bit_array.is_utf8(payload) {
+        True -> do_resolve_fragments(rest, Empty, [Text(payload:), ..resolved])
+        False -> Error(NotUtf8)
+      }
+    }
+    // Continuation frames cannot be the first frame in a fragmentation sequence.
+    [Complete(Continuation(..)), ..], Empty -> Error(OrphanedContinuation)
+    // Rest FIN=1 frames are joining resolved list without further processing.
+    [Complete(frame), ..rest], Empty ->
+      do_resolve_fragments(rest, Empty, [frame, ..resolved])
+
+    // FIN=0 Text frame begins accumulation of fragmented frames.
+    [Incomplete(Text(payload:)), ..rest], Empty ->
+      do_resolve_fragments(rest, Accumulating(Text, payload), resolved)
+    // FIN=0 Binary frame begins accumulation of fragmented frames.
+    [Incomplete(Binary(payload:)), ..rest], Empty ->
+      do_resolve_fragments(rest, Accumulating(Binary, payload), resolved)
+    // Continuation frames cannot be the first frame in a fragmentation sequence.
+    [Incomplete(Continuation(..)), ..], Empty -> Error(OrphanedContinuation)
+    // Control frames cannot be fragmented.
+    [Incomplete(..), ..], Empty -> Error(ControlFrameFragmented)
+
+    // FIN=0 Continuation frame continues fragmentation.
+    [Incomplete(Continuation(payload:)), ..rest], Accumulating(builder, acc) ->
+      do_resolve_fragments(
+        rest,
+        Accumulating(builder, <<acc:bits, payload:bits>>),
+        resolved,
+      )
+    // Concurrent fragmentation is not allowed.
+    [Incomplete(..), ..], Accumulating(..) -> Error(ConcurrentFragmentation)
+
+    // FIN=1 Continuation frame completes fragmentation.
+    [Complete(Continuation(payload:)), ..rest], Accumulating(builder, acc) ->
+      do_resolve_fragments(
+        [Complete(builder(<<acc:bits, payload:bits>>)), ..rest],
+        Empty,
+        resolved,
+      )
+    // Fragmentation interrupted.
+    [Complete(..), ..], Accumulating(..) -> Error(FragmentationInterrupted)
+  }
 }
