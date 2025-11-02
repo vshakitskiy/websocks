@@ -1,7 +1,6 @@
 import gleam/bit_array
 import gleam/crypto
-import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 
@@ -13,6 +12,42 @@ pub fn compute_accept(key: String) -> String {
   |> crypto.hash(crypto.Sha1, _)
   |> bit_array.base64_encode(True)
 }
+
+pub fn mask(payload: BitArray, mask: BitArray) -> BitArray {
+  let payload_length = bit_array.byte_size(payload)
+  repeat_mask(mask, payload_length)
+  |> exor(payload, _)
+}
+
+@external(erlang, "crypto", "exor")
+fn exor(bin1: BitArray, bin2: BitArray) -> BitArray
+
+fn repeat_mask(mask: BitArray, payload_length: Int) -> BitArray {
+  let mask_length = bit_array.byte_size(mask)
+
+  case payload_length {
+    _ if payload_length <= mask_length ->
+      bit_array.slice(mask, 0, payload_length)
+      |> result.unwrap(<<>>)
+    _ -> {
+      let repeat = payload_length / mask_length
+      let remainder = payload_length % mask_length
+
+      let base = copy(mask, repeat)
+
+      case remainder {
+        0 -> base
+        n -> {
+          let partial = bit_array.slice(mask, 0, n) |> result.unwrap(<<>>)
+          <<base:bits, partial:bits>>
+        }
+      }
+    }
+  }
+}
+
+@external(erlang, "binary", "copy")
+fn copy(subject: BitArray, n: Int) -> BitArray
 
 pub type CloseReason {
   NormalClosure(data: BitArray)
@@ -145,38 +180,112 @@ pub fn decode_frame(
   }
 }
 
-pub fn mask(payload: BitArray, mask: BitArray) -> BitArray {
-  let payload_length = bit_array.byte_size(payload)
-  repeat_mask(mask, payload_length)
-  |> exor(payload, _)
-}
-
-@external(erlang, "crypto", "exor")
-fn exor(bin1: BitArray, bin2: BitArray) -> BitArray
-
-fn repeat_mask(mask: BitArray, payload_length: Int) -> BitArray {
-  let mask_length = bit_array.byte_size(mask)
-
-  case payload_length {
-    _ if payload_length <= mask_length ->
-      bit_array.slice(mask, 0, payload_length)
-      |> result.unwrap(<<>>)
-    _ -> {
-      let repeat = payload_length / mask_length
-      let remainder = payload_length % mask_length
-
-      let base = copy(mask, repeat)
-
-      case remainder {
-        0 -> base
-        n -> {
-          let partial = bit_array.slice(mask, 0, n) |> result.unwrap(<<>>)
-          <<base:bits, partial:bits>>
-        }
+pub fn encode_frame(
+  frame frame: Frame,
+  finished finished: Bool,
+  masking masking: Option(BitArray),
+) -> BitArray {
+  let #(opcode, payload_length, payload) = case frame {
+    Continuation(payload) -> #(0, bit_array.byte_size(payload), payload)
+    Text(payload) -> #(1, bit_array.byte_size(payload), payload)
+    Binary(payload) -> #(2, bit_array.byte_size(payload), payload)
+    Ping(payload) -> #(9, bit_array.byte_size(payload), payload)
+    Pong(payload) -> #(10, bit_array.byte_size(payload), payload)
+    Close(reason) -> {
+      let #(payload_length, payload) = case reason {
+        NormalClosure(data) -> #(bit_array.byte_size(data) + 2, <<
+          1000:size(16),
+          data:bits,
+        >>)
+        GoingAway(data) -> #(bit_array.byte_size(data) + 2, <<
+          1001:size(16),
+          data:bits,
+        >>)
+        ProtocolError(data) -> #(bit_array.byte_size(data) + 2, <<
+          1002:size(16),
+          data:bits,
+        >>)
+        UnsupportedData(data) -> #(bit_array.byte_size(data) + 2, <<
+          1003:size(16),
+          data:bits,
+        >>)
+        InvalidPayloadData(data) -> #(bit_array.byte_size(data) + 2, <<
+          1007:size(16),
+          data:bits,
+        >>)
+        PolicyViolation(data) -> #(bit_array.byte_size(data) + 2, <<
+          1008:size(16),
+          data:bits,
+        >>)
+        MessageTooBig(data) -> #(bit_array.byte_size(data) + 2, <<
+          1009:size(16),
+          data:bits,
+        >>)
+        MandatoryExtension(data) -> #(bit_array.byte_size(data) + 2, <<
+          1010:size(16),
+          data:bits,
+        >>)
+        InternalError(data) -> #(bit_array.byte_size(data) + 2, <<
+          1011:size(16),
+          data:bits,
+        >>)
+        ServiceRestart(data) -> #(bit_array.byte_size(data) + 2, <<
+          1012:size(16),
+          data:bits,
+        >>)
+        TryAgainLater(data) -> #(bit_array.byte_size(data) + 2, <<
+          1013:size(16),
+          data:bits,
+        >>)
+        BadGateway(data) -> #(bit_array.byte_size(data) + 2, <<
+          1014:size(16),
+          data:bits,
+        >>)
+        TLSHandshake(data) -> #(bit_array.byte_size(data) + 2, <<
+          1015:size(16),
+          data:bits,
+        >>)
+        CustomCloseCode(code, data) -> #(bit_array.byte_size(data) + 2, <<
+          code:size(16),
+          data:bits,
+        >>)
       }
+
+      #(8, payload_length, payload)
     }
   }
-}
 
-@external(erlang, "binary", "copy")
-fn copy(subject: BitArray, n: Int) -> BitArray
+  let encoded_payload_length = case payload_length {
+    _ if payload_length <= 125 -> payload_length
+    _ if payload_length <= 65_535 -> 126
+    _ -> 127
+  }
+
+  let extended_payload = case encoded_payload_length {
+    126 -> <<payload_length:size(16)>>
+    127 -> <<payload_length:size(64)>>
+    _ -> <<>>
+  }
+
+  let #(mask_bit, mask, payload) = case masking {
+    Some(mask_bytes) -> #(1, mask_bytes, mask(payload, mask_bytes))
+    None -> #(0, <<>>, payload)
+  }
+
+  let fin = case finished {
+    True -> 1
+    False -> 0
+  }
+
+  <<
+    fin:1,
+    // TODO: compression
+    0:3,
+    opcode:4,
+    mask_bit:1,
+    encoded_payload_length:7,
+    extended_payload:bits,
+    mask:bits,
+    payload:bits,
+  >>
+}

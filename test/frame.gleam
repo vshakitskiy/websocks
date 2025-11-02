@@ -78,13 +78,13 @@ pub fn construct(
     None -> #(0, <<>>, payload)
   }
 
-  let payload_length = case payload_length {
+  let encoded_payload_length = case payload_length {
     _ if payload_length <= 125 -> payload_length
     _ if payload_length <= 65_535 -> 126
     _ -> 127
   }
 
-  let extended_payload = case payload_length {
+  let extended_payload = case encoded_payload_length {
     126 -> <<payload_length:size(16)>>
     127 -> <<payload_length:size(64)>>
     _ -> <<>>
@@ -97,7 +97,7 @@ pub fn construct(
     rsv3:1,
     opcode:4,
     mask_bit:1,
-    payload_length:7,
+    encoded_payload_length:7,
     extended_payload:bits,
     mask:bits,
     payload:bits,
