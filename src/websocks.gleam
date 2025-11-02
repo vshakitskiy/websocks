@@ -1,3 +1,6 @@
+// TODO: Documentation
+// TODO: Compression
+
 import gleam/bit_array
 import gleam/crypto
 import gleam/option.{type Option, None, Some}
@@ -180,9 +183,9 @@ pub fn decode_frame(
   }
 }
 
-pub fn encode_frame(
+fn encode_frame(
   frame frame: Frame,
-  finished finished: Bool,
+  final final: Bool,
   masking masking: Option(BitArray),
 ) -> BitArray {
   let #(opcode, payload_length, payload) = case frame {
@@ -272,7 +275,7 @@ pub fn encode_frame(
     None -> #(0, <<>>, payload)
   }
 
-  let fin = case finished {
+  let fin = case final {
     True -> 1
     False -> 0
   }
@@ -288,4 +291,49 @@ pub fn encode_frame(
     mask:bits,
     payload:bits,
   >>
+}
+
+pub fn encode_continuation_frame(
+  payload payload: BitArray,
+  final final: Bool,
+  masking masking: Option(BitArray),
+) -> BitArray {
+  encode_frame(Continuation(payload:), final:, masking:)
+}
+
+pub fn encode_text_frame(
+  payload payload: BitArray,
+  final final: Bool,
+  masking masking: Option(BitArray),
+) -> BitArray {
+  encode_frame(Text(payload:), final:, masking:)
+}
+
+pub fn encode_binary_frame(
+  payload payload: BitArray,
+  final final: Bool,
+  masking masking: Option(BitArray),
+) -> BitArray {
+  encode_frame(Binary(payload:), final:, masking:)
+}
+
+pub fn encode_ping_frame(
+  payload payload: BitArray,
+  masking masking: Option(BitArray),
+) -> BitArray {
+  encode_frame(Ping(payload:), final: True, masking:)
+}
+
+pub fn encode_pong_frame(
+  payload payload: BitArray,
+  masking masking: Option(BitArray),
+) -> BitArray {
+  encode_frame(Pong(payload:), final: True, masking:)
+}
+
+pub fn encode_close_frame(
+  reason reason: CloseReason,
+  masking masking: Option(BitArray),
+) -> BitArray {
+  encode_frame(Close(reason:), final: True, masking:)
 }

@@ -500,10 +500,10 @@ pub fn decode_close_empty_data_test() {
 // -----------------------------------------------------------------------------
 
 pub fn encode_text_frame_test() {
-  let frame = websocks.Text(payload: <<"Hello, Joe!":utf8>>)
+  let payload = <<"Hello, Joe!":utf8>>
 
   let encoded_frame =
-    websocks.encode_frame(frame, finished: True, masking: None)
+    websocks.encode_text_frame(payload, final: True, masking: None)
 
   let expect =
     frame.construct(
@@ -513,7 +513,7 @@ pub fn encode_text_frame_test() {
       rsv3: False,
       opcode: frame.Text,
       mask: None,
-      payload: <<"Hello, Joe!":utf8>>,
+      payload:,
     )
 
   assert encoded_frame == expect
@@ -521,11 +521,10 @@ pub fn encode_text_frame_test() {
 
 pub fn encode_text_frame_masked_test() {
   let payload = <<"Hello, Joe!":utf8>>
-  let frame = websocks.Text(payload:)
   let mask = <<0x37, 0xfa, 0x21, 0x3d>>
 
   let encoded_frame =
-    websocks.encode_frame(frame, finished: True, masking: Some(mask))
+    websocks.encode_text_frame(payload, final: True, masking: Some(mask))
 
   let expect =
     frame.construct(
@@ -543,10 +542,12 @@ pub fn encode_text_frame_masked_test() {
 
 pub fn encode_closing_frame_test() {
   let data = <<"Hello, Joe!":utf8>>
-  let frame = websocks.Close(websocks.NormalClosure(data:))
 
   let encoded_frame =
-    websocks.encode_frame(frame, finished: True, masking: None)
+    websocks.encode_close_frame(
+      reason: websocks.NormalClosure(data:),
+      masking: None,
+    )
 
   let expect =
     frame.construct(
@@ -564,10 +565,8 @@ pub fn encode_closing_frame_test() {
 
 pub fn encode_binary_frame_test() {
   let payload = <<0x01, 0x02, 0x03, 0x04, 0x05>>
-  let frame = websocks.Binary(payload:)
-
   let encoded_frame =
-    websocks.encode_frame(frame, finished: True, masking: None)
+    websocks.encode_binary_frame(payload, final: True, masking: None)
 
   let expect =
     frame.construct(
@@ -585,10 +584,7 @@ pub fn encode_binary_frame_test() {
 
 pub fn encode_ping_frame_test() {
   let payload = <<"ping":utf8>>
-  let frame = websocks.Ping(payload:)
-
-  let encoded_frame =
-    websocks.encode_frame(frame, finished: True, masking: None)
+  let encoded_frame = websocks.encode_ping_frame(payload, masking: None)
 
   let expect =
     frame.construct(
@@ -606,10 +602,7 @@ pub fn encode_ping_frame_test() {
 
 pub fn encode_pong_frame_test() {
   let payload = <<"pong":utf8>>
-  let frame = websocks.Pong(payload:)
-
-  let encoded_frame =
-    websocks.encode_frame(frame, finished: True, masking: None)
+  let encoded_frame = websocks.encode_pong_frame(payload, masking: None)
 
   let expect =
     frame.construct(
@@ -627,10 +620,9 @@ pub fn encode_pong_frame_test() {
 
 pub fn encode_continuation_frame_test() {
   let payload = <<"continue":utf8>>
-  let frame = websocks.Continuation(payload:)
 
   let encoded_frame =
-    websocks.encode_frame(frame, finished: False, masking: None)
+    websocks.encode_continuation_frame(payload, final: False, masking: None)
 
   let expect =
     frame.construct(
@@ -648,10 +640,9 @@ pub fn encode_continuation_frame_test() {
 
 pub fn encode_incomplete_frame_test() {
   let payload = <<"incomplete":utf8>>
-  let frame = websocks.Text(payload:)
 
   let encoded_frame =
-    websocks.encode_frame(frame, finished: False, masking: None)
+    websocks.encode_text_frame(payload, final: False, masking: None)
 
   let expect =
     frame.construct(
@@ -669,10 +660,9 @@ pub fn encode_incomplete_frame_test() {
 
 pub fn encode_empty_payload_test() {
   let payload = <<>>
-  let frame = websocks.Text(payload:)
 
   let encoded_frame =
-    websocks.encode_frame(frame, finished: True, masking: None)
+    websocks.encode_text_frame(payload, final: True, masking: None)
 
   let expect =
     frame.construct(
@@ -692,10 +682,9 @@ pub fn encode_126_byte_extended_length_test() {
   let payload =
     list.repeat(0x41, 126)
     |> list.fold(<<>>, fn(acc, byte) { <<acc:bits, byte>> })
-  let frame = websocks.Binary(payload:)
 
   let encoded_frame =
-    websocks.encode_frame(frame, finished: True, masking: None)
+    websocks.encode_binary_frame(payload, final: True, masking: None)
 
   let expect =
     frame.construct(
@@ -715,10 +704,9 @@ pub fn encode_large_payload_test() {
   let payload =
     list.repeat(0x41, 500)
     |> list.fold(<<>>, fn(acc, byte) { <<acc:bits, byte>> })
-  let frame = websocks.Binary(payload:)
 
   let encoded_frame =
-    websocks.encode_frame(frame, finished: True, masking: None)
+    websocks.encode_binary_frame(payload, final: True, masking: None)
 
   let expect =
     frame.construct(
@@ -754,10 +742,8 @@ pub fn encode_all_close_codes_test() {
 
   list.each(close_frames, fn(pair) {
     let #(reason, payload) = pair
-    let frame = websocks.Close(reason)
 
-    let encoded_frame =
-      websocks.encode_frame(frame, finished: True, masking: None)
+    let encoded_frame = websocks.encode_close_frame(reason, masking: None)
 
     let expect =
       frame.construct(
@@ -777,10 +763,12 @@ pub fn encode_all_close_codes_test() {
 pub fn encode_custom_close_code_test() {
   let code = 4000
   let data = <<"custom":utf8>>
-  let frame = websocks.Close(websocks.CustomCloseCode(code:, data:))
 
   let encoded_frame =
-    websocks.encode_frame(frame, finished: True, masking: None)
+    websocks.encode_close_frame(
+      websocks.CustomCloseCode(code:, data:),
+      masking: None,
+    )
 
   let expect =
     frame.construct(
@@ -801,69 +789,71 @@ pub fn encode_custom_close_code_test() {
 // -----------------------------------------------------------------------------
 
 pub fn round_trip_text_test() {
-  let original = websocks.Text(payload: <<"Hello, World!":utf8>>)
-  let encoded = websocks.encode_frame(original, finished: True, masking: None)
+  let payload = <<"Hello, World!":utf8>>
+  let encoded = websocks.encode_text_frame(payload, final: True, masking: None)
   let assert Ok(#(decoded, <<>>)) = websocks.decode_frame(encoded)
-  assert decoded == websocks.Complete(original)
+  assert decoded == websocks.Complete(websocks.Text(payload:))
 }
 
 pub fn round_trip_text_masked_test() {
-  let original = websocks.Text(payload: <<"Hello, World!":utf8>>)
+  let payload = <<"Hello, World!":utf8>>
   let mask = <<0x37, 0xfa, 0x21, 0x3d>>
   let encoded =
-    websocks.encode_frame(original, finished: True, masking: Some(mask))
+    websocks.encode_text_frame(payload, final: True, masking: Some(mask))
   let assert Ok(#(decoded, <<>>)) = websocks.decode_frame(encoded)
-  assert decoded == websocks.Complete(original)
+  assert decoded == websocks.Complete(websocks.Text(payload:))
 }
 
 pub fn round_trip_binary_test() {
-  let original = websocks.Binary(payload: <<0x01, 0x02, 0x03, 0x04, 0x05>>)
-  let encoded = websocks.encode_frame(original, finished: True, masking: None)
+  let payload = <<0x01, 0x02, 0x03, 0x04, 0x05>>
+  let encoded =
+    websocks.encode_binary_frame(payload, final: True, masking: None)
   let assert Ok(#(decoded, <<>>)) = websocks.decode_frame(encoded)
-  assert decoded == websocks.Complete(original)
+  assert decoded == websocks.Complete(websocks.Binary(payload:))
 }
 
 pub fn round_trip_ping_test() {
-  let original = websocks.Ping(payload: <<"ping":utf8>>)
-  let encoded = websocks.encode_frame(original, finished: True, masking: None)
+  let payload = <<"ping":utf8>>
+  let encoded = websocks.encode_ping_frame(payload, masking: None)
   let assert Ok(#(decoded, <<>>)) = websocks.decode_frame(encoded)
-  assert decoded == websocks.Complete(original)
+  assert decoded == websocks.Complete(websocks.Ping(payload:))
 }
 
 pub fn round_trip_pong_test() {
-  let original = websocks.Pong(payload: <<"pong":utf8>>)
-  let encoded = websocks.encode_frame(original, finished: True, masking: None)
+  let payload = <<"pong":utf8>>
+  let encoded = websocks.encode_pong_frame(payload, masking: None)
   let assert Ok(#(decoded, <<>>)) = websocks.decode_frame(encoded)
-  assert decoded == websocks.Complete(original)
+  assert decoded == websocks.Complete(websocks.Pong(payload:))
 }
 
 pub fn round_trip_close_test() {
-  let original = websocks.Close(websocks.NormalClosure(data: <<"bye":utf8>>))
-  let encoded = websocks.encode_frame(original, finished: True, masking: None)
+  let data = <<"bye":utf8>>
+  let reason = websocks.NormalClosure(data:)
+  let encoded = websocks.encode_close_frame(reason, masking: None)
   let assert Ok(#(decoded, <<>>)) = websocks.decode_frame(encoded)
-  assert decoded == websocks.Complete(original)
+  assert decoded == websocks.Complete(websocks.Close(reason))
 }
 
 pub fn round_trip_incomplete_test() {
-  let original = websocks.Text(payload: <<"partial":utf8>>)
-  let encoded = websocks.encode_frame(original, finished: False, masking: None)
+  let payload = <<"partial":utf8>>
+  let encoded = websocks.encode_text_frame(payload, final: False, masking: None)
   let assert Ok(#(decoded, <<>>)) = websocks.decode_frame(encoded)
-  assert decoded == websocks.Incomplete(original)
+  assert decoded == websocks.Incomplete(websocks.Text(payload:))
 }
 
 pub fn round_trip_large_payload_test() {
   let payload =
     list.repeat(0x41, 1000)
     |> list.fold(<<>>, fn(acc, byte) { <<acc:bits, byte>> })
-  let original = websocks.Binary(payload:)
-  let encoded = websocks.encode_frame(original, finished: True, masking: None)
+  let encoded =
+    websocks.encode_binary_frame(payload, final: True, masking: None)
   let assert Ok(#(decoded, <<>>)) = websocks.decode_frame(encoded)
-  assert decoded == websocks.Complete(original)
+  assert decoded == websocks.Complete(websocks.Binary(payload:))
 }
 
 pub fn round_trip_empty_payload_test() {
-  let original = websocks.Text(payload: <<>>)
-  let encoded = websocks.encode_frame(original, finished: True, masking: None)
+  let payload = <<>>
+  let encoded = websocks.encode_text_frame(payload, final: True, masking: None)
   let assert Ok(#(decoded, <<>>)) = websocks.decode_frame(encoded)
-  assert decoded == websocks.Complete(original)
+  assert decoded == websocks.Complete(websocks.Text(payload:))
 }
