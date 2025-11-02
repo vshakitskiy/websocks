@@ -857,3 +857,530 @@ pub fn round_trip_empty_payload_test() {
   let assert Ok(#(decoded, <<>>)) = websocks.decode_frame(encoded)
   assert decoded == websocks.Complete(websocks.Text(payload:))
 }
+
+// -----------------------------------------------------------------------------
+// Resolve Fragments
+// -----------------------------------------------------------------------------
+
+pub fn resolve_complete_frames_test() {
+  let frames = [
+    websocks.Complete(websocks.Text(payload: <<"Hello":utf8>>)),
+    websocks.Complete(websocks.Text(payload: <<"World":utf8>>)),
+  ]
+
+  let assert Ok(#(resolved, _)) =
+    websocks.resolve_fragments(frames, websocks.create_context())
+
+  assert resolved
+    == [
+      websocks.Text(payload: <<"Hello":utf8>>),
+      websocks.Text(payload: <<"World":utf8>>),
+    ]
+}
+
+pub fn resolve_empty_frames_test() {
+  let frames = []
+  let assert Ok(#(resolved, context)) =
+    websocks.resolve_fragments(frames, websocks.create_context())
+  assert resolved == []
+  assert context == websocks.create_context()
+}
+
+pub fn resolve_complete_text_not_utf8_test() {
+  let frames = [websocks.Complete(websocks.Text(payload: <<0xff, 0xff, 0xff>>))]
+
+  let result = websocks.resolve_fragments(frames, websocks.create_context())
+
+  assert result == Error(websocks.NotUtf8)
+}
+
+pub fn resolve_orphaned_continuation_complete_test() {
+  let frames = [
+    websocks.Complete(websocks.Continuation(payload: <<"test":utf8>>)),
+  ]
+
+  let result = websocks.resolve_fragments(frames, websocks.create_context())
+
+  assert result == Error(websocks.OrphanedContinuation)
+}
+
+pub fn resolve_orphaned_continuation_incomplete_test() {
+  let frames = [
+    websocks.Incomplete(websocks.Continuation(payload: <<"test":utf8>>)),
+  ]
+
+  let result = websocks.resolve_fragments(frames, websocks.create_context())
+
+  assert result == Error(websocks.OrphanedContinuation)
+}
+
+pub fn resolve_control_frame_fragmented_ping_test() {
+  let frames = [websocks.Incomplete(websocks.Ping(payload: <<"ping":utf8>>))]
+
+  let result = websocks.resolve_fragments(frames, websocks.create_context())
+
+  assert result == Error(websocks.ControlFrameFragmented)
+}
+
+pub fn resolve_control_frame_fragmented_pong_test() {
+  let frames = [websocks.Incomplete(websocks.Pong(payload: <<"pong":utf8>>))]
+
+  let result = websocks.resolve_fragments(frames, websocks.create_context())
+
+  assert result == Error(websocks.ControlFrameFragmented)
+}
+
+pub fn resolve_control_frame_fragmented_close_test() {
+  let frames = [
+    websocks.Incomplete(
+      websocks.Close(websocks.NormalClosure(data: <<"bye":utf8>>)),
+    ),
+  ]
+
+  let result = websocks.resolve_fragments(frames, websocks.create_context())
+
+  assert result == Error(websocks.ControlFrameFragmented)
+}
+
+pub fn resolve_complete_binary_frame_test() {
+  let payload = <<0x01, 0x02, 0x03>>
+  let frames = [websocks.Complete(websocks.Binary(payload:))]
+
+  let assert Ok(#(resolved, context)) =
+    websocks.resolve_fragments(frames, websocks.create_context())
+
+  assert resolved == [websocks.Binary(payload:)]
+  assert context == websocks.create_context()
+}
+
+pub fn resolve_complete_ping_frame_test() {
+  let payload = <<"ping":utf8>>
+  let frames = [websocks.Complete(websocks.Ping(payload:))]
+
+  let assert Ok(#(resolved, _)) =
+    websocks.resolve_fragments(frames, websocks.create_context())
+
+  assert resolved == [websocks.Ping(payload:)]
+}
+
+pub fn resolve_complete_pong_frame_test() {
+  let payload = <<"pong":utf8>>
+  let frames = [websocks.Complete(websocks.Pong(payload:))]
+
+  let assert Ok(#(resolved, _)) =
+    websocks.resolve_fragments(frames, websocks.create_context())
+
+  assert resolved == [websocks.Pong(payload:)]
+}
+
+pub fn resolve_complete_close_frame_test() {
+  let frames = [
+    websocks.Complete(
+      websocks.Close(websocks.NormalClosure(data: <<"bye":utf8>>)),
+    ),
+  ]
+
+  let assert Ok(#(resolved, _)) =
+    websocks.resolve_fragments(frames, websocks.create_context())
+
+  assert resolved
+    == [websocks.Close(websocks.NormalClosure(data: <<"bye":utf8>>))]
+}
+
+pub fn resolve_text_fragmentation_simple_test() {
+  let frames = [
+    websocks.Incomplete(websocks.Text(payload: <<"Hel":utf8>>)),
+    websocks.Complete(websocks.Continuation(payload: <<"lo":utf8>>)),
+  ]
+
+  let assert Ok(#(resolved, context)) =
+    websocks.resolve_fragments(frames, websocks.create_context())
+
+  assert resolved == [websocks.Text(payload: <<"Hello":utf8>>)]
+  assert context == websocks.create_context()
+}
+
+pub fn resolve_binary_fragmentation_simple_test() {
+  let frames = [
+    websocks.Incomplete(websocks.Binary(payload: <<0x01, 0x02>>)),
+    websocks.Complete(websocks.Continuation(payload: <<0x03, 0x04>>)),
+  ]
+
+  let assert Ok(#(resolved, context)) =
+    websocks.resolve_fragments(frames, websocks.create_context())
+
+  assert resolved == [websocks.Binary(payload: <<0x01, 0x02, 0x03, 0x04>>)]
+  assert context == websocks.create_context()
+}
+
+pub fn resolve_text_fragmentation_multiple_continuations_test() {
+  let frames = [
+    websocks.Incomplete(websocks.Text(payload: <<"H":utf8>>)),
+    websocks.Incomplete(websocks.Continuation(payload: <<"e":utf8>>)),
+    websocks.Incomplete(websocks.Continuation(payload: <<"l":utf8>>)),
+    websocks.Incomplete(websocks.Continuation(payload: <<"l":utf8>>)),
+    websocks.Complete(websocks.Continuation(payload: <<"o":utf8>>)),
+  ]
+
+  let assert Ok(#(resolved, context)) =
+    websocks.resolve_fragments(frames, websocks.create_context())
+
+  assert resolved == [websocks.Text(payload: <<"Hello":utf8>>)]
+  assert context == websocks.create_context()
+}
+
+pub fn resolve_concurrent_fragmentation_test() {
+  let frames = [
+    websocks.Incomplete(websocks.Text(payload: <<"Hel":utf8>>)),
+    websocks.Incomplete(websocks.Text(payload: <<"World":utf8>>)),
+  ]
+
+  let result = websocks.resolve_fragments(frames, websocks.create_context())
+
+  assert result == Error(websocks.ConcurrentFragmentation)
+}
+
+pub fn resolve_concurrent_fragmentation_binary_test() {
+  let frames = [
+    websocks.Incomplete(websocks.Text(payload: <<"Hel":utf8>>)),
+    websocks.Incomplete(websocks.Binary(payload: <<0x01>>)),
+  ]
+
+  let result = websocks.resolve_fragments(frames, websocks.create_context())
+
+  assert result == Error(websocks.ConcurrentFragmentation)
+}
+
+pub fn resolve_fragmentation_interrupted_test() {
+  let frames = [
+    websocks.Incomplete(websocks.Text(payload: <<"Hel":utf8>>)),
+    websocks.Complete(websocks.Text(payload: <<"World":utf8>>)),
+  ]
+
+  let result = websocks.resolve_fragments(frames, websocks.create_context())
+
+  assert result == Error(websocks.FragmentationInterrupted)
+}
+
+pub fn resolve_fragmentation_interrupted_by_binary_test() {
+  let frames = [
+    websocks.Incomplete(websocks.Text(payload: <<"Hel":utf8>>)),
+    websocks.Complete(websocks.Binary(payload: <<0x01>>)),
+  ]
+
+  let result = websocks.resolve_fragments(frames, websocks.create_context())
+
+  assert result == Error(websocks.FragmentationInterrupted)
+}
+
+pub fn resolve_fragmentation_interrupted_by_ping_test() {
+  let frames = [
+    websocks.Incomplete(websocks.Text(payload: <<"Hel":utf8>>)),
+    websocks.Complete(websocks.Ping(payload: <<"ping":utf8>>)),
+  ]
+
+  let result = websocks.resolve_fragments(frames, websocks.create_context())
+
+  assert result == Error(websocks.FragmentationInterrupted)
+}
+
+pub fn resolve_context_preserved_incomplete_test() {
+  let frames = [websocks.Incomplete(websocks.Text(payload: <<"Hel":utf8>>))]
+
+  let assert Ok(#(resolved, context)) =
+    websocks.resolve_fragments(frames, websocks.create_context())
+
+  assert resolved == []
+  assert websocks.extract_accumulated_context_value(context)
+    == Ok(websocks.Text(payload: <<"Hel":utf8>>))
+}
+
+pub fn resolve_context_continuation_test() {
+  let frames = [websocks.Incomplete(websocks.Text(payload: <<"Hel":utf8>>))]
+
+  let assert Ok(#(resolved, context)) =
+    websocks.resolve_fragments(frames, websocks.create_context())
+
+  assert resolved == []
+
+  let next_frames = [
+    websocks.Complete(websocks.Continuation(payload: <<"lo":utf8>>)),
+  ]
+
+  let assert Ok(#(resolved, context)) =
+    websocks.resolve_fragments(next_frames, context)
+
+  assert resolved == [websocks.Text(payload: <<"Hello":utf8>>)]
+  assert context == websocks.create_context()
+}
+
+pub fn resolve_fragmentation_with_subsequent_message_test() {
+  let frames = [
+    websocks.Incomplete(websocks.Text(payload: <<"Hel":utf8>>)),
+    websocks.Complete(websocks.Continuation(payload: <<"lo":utf8>>)),
+    websocks.Complete(websocks.Text(payload: <<"World":utf8>>)),
+  ]
+
+  let assert Ok(#(resolved, context)) =
+    websocks.resolve_fragments(frames, websocks.create_context())
+
+  assert resolved
+    == [
+      websocks.Text(payload: <<"Hello":utf8>>),
+      websocks.Text(payload: <<"World":utf8>>),
+    ]
+  assert context == websocks.create_context()
+}
+
+pub fn resolve_multiple_fragmentations_test() {
+  let frames = [
+    websocks.Incomplete(websocks.Text(payload: <<"Hel":utf8>>)),
+    websocks.Complete(websocks.Continuation(payload: <<"lo":utf8>>)),
+    websocks.Incomplete(websocks.Binary(payload: <<0x01>>)),
+    websocks.Complete(websocks.Continuation(payload: <<0x02>>)),
+  ]
+
+  let assert Ok(#(resolved, context)) =
+    websocks.resolve_fragments(frames, websocks.create_context())
+
+  assert resolved
+    == [
+      websocks.Text(payload: <<"Hello":utf8>>),
+      websocks.Binary(payload: <<0x01, 0x02>>),
+    ]
+  assert context == websocks.create_context()
+}
+
+pub fn resolve_fragmented_text_utf8_validation_test() {
+  let frames = [
+    websocks.Incomplete(websocks.Text(payload: <<"Hel":utf8>>)),
+    websocks.Complete(websocks.Continuation(payload: <<"lo":utf8>>)),
+  ]
+
+  let assert Ok(#(resolved, _)) =
+    websocks.resolve_fragments(frames, websocks.create_context())
+
+  assert resolved == [websocks.Text(payload: <<"Hello":utf8>>)]
+}
+
+pub fn resolve_empty_payload_frames_test() {
+  let frames = [
+    websocks.Incomplete(websocks.Text(payload: <<>>)),
+    websocks.Complete(websocks.Continuation(payload: <<"Hello":utf8>>)),
+  ]
+
+  let assert Ok(#(resolved, _)) =
+    websocks.resolve_fragments(frames, websocks.create_context())
+
+  assert resolved == [websocks.Text(payload: <<"Hello":utf8>>)]
+}
+
+pub fn resolve_fragmentation_empty_continuation_test() {
+  let frames = [
+    websocks.Incomplete(websocks.Text(payload: <<"Hello":utf8>>)),
+    websocks.Complete(websocks.Continuation(payload: <<>>)),
+  ]
+
+  let assert Ok(#(resolved, _)) =
+    websocks.resolve_fragments(frames, websocks.create_context())
+
+  assert resolved == [websocks.Text(payload: <<"Hello":utf8>>)]
+}
+
+pub fn resolve_long_fragmentation_chain_test() {
+  let frames = [
+    websocks.Incomplete(websocks.Binary(payload: <<0x01>>)),
+    websocks.Incomplete(websocks.Continuation(payload: <<0x02>>)),
+    websocks.Incomplete(websocks.Continuation(payload: <<0x03>>)),
+    websocks.Incomplete(websocks.Continuation(payload: <<0x04>>)),
+    websocks.Incomplete(websocks.Continuation(payload: <<0x05>>)),
+    websocks.Incomplete(websocks.Continuation(payload: <<0x06>>)),
+    websocks.Incomplete(websocks.Continuation(payload: <<0x07>>)),
+    websocks.Complete(websocks.Continuation(payload: <<0x08>>)),
+  ]
+
+  let assert Ok(#(resolved, _)) =
+    websocks.resolve_fragments(frames, websocks.create_context())
+
+  assert resolved
+    == [
+      websocks.Binary(payload: <<
+        0x01,
+        0x02,
+        0x03,
+        0x04,
+        0x05,
+        0x06,
+        0x07,
+        0x08,
+      >>),
+    ]
+}
+
+pub fn resolve_mixed_complete_and_fragmented_test() {
+  let frames = [
+    websocks.Complete(websocks.Text(payload: <<"First":utf8>>)),
+    websocks.Incomplete(websocks.Binary(payload: <<0x01>>)),
+    websocks.Complete(websocks.Continuation(payload: <<0x02>>)),
+    websocks.Complete(websocks.Text(payload: <<"Last":utf8>>)),
+  ]
+
+  let assert Ok(#(resolved, _)) =
+    websocks.resolve_fragments(frames, websocks.create_context())
+
+  assert resolved
+    == [
+      websocks.Text(payload: <<"First":utf8>>),
+      websocks.Binary(payload: <<0x01, 0x02>>),
+      websocks.Text(payload: <<"Last":utf8>>),
+    ]
+}
+
+pub fn resolve_context_preserved_mid_fragmentation_test() {
+  let frames = [
+    websocks.Incomplete(websocks.Text(payload: <<"Hel":utf8>>)),
+    websocks.Incomplete(websocks.Continuation(payload: <<"lo":utf8>>)),
+  ]
+
+  let assert Ok(#(resolved, context)) =
+    websocks.resolve_fragments(frames, websocks.create_context())
+
+  assert resolved == []
+  assert websocks.extract_accumulated_context_value(context)
+    == Ok(websocks.Text(payload: <<"Hello":utf8>>))
+
+  let next_frames = [
+    websocks.Incomplete(websocks.Continuation(payload: <<" Wor":utf8>>)),
+    websocks.Complete(websocks.Continuation(payload: <<"ld":utf8>>)),
+  ]
+
+  let assert Ok(#(resolved, context)) =
+    websocks.resolve_fragments(next_frames, context)
+
+  assert resolved == [websocks.Text(payload: <<"Hello World":utf8>>)]
+  assert context == websocks.create_context()
+}
+
+pub fn resolve_stream_simulation_test() {
+  let batch1 = [
+    websocks.Complete(websocks.Text(payload: <<"Message1":utf8>>)),
+    websocks.Incomplete(websocks.Binary(payload: <<0x01, 0x02>>)),
+    websocks.Incomplete(websocks.Continuation(payload: <<0x03>>)),
+  ]
+
+  let assert Ok(#(resolved1, context1)) =
+    websocks.resolve_fragments(batch1, websocks.create_context())
+  assert resolved1 == [websocks.Text(payload: <<"Message1":utf8>>)]
+  assert websocks.extract_accumulated_context_value(context1)
+    == Ok(websocks.Binary(payload: <<0x01, 0x02, 0x03>>))
+
+  let batch2 = [
+    websocks.Incomplete(websocks.Continuation(payload: <<0x04, 0x05>>)),
+    websocks.Incomplete(websocks.Continuation(payload: <<0x06>>)),
+  ]
+
+  let assert Ok(#(resolved2, context2)) =
+    websocks.resolve_fragments(batch2, context1)
+  assert resolved2 == []
+  assert websocks.extract_accumulated_context_value(context2)
+    == Ok(websocks.Binary(payload: <<0x01, 0x02, 0x03, 0x04, 0x05, 0x06>>))
+
+  let batch3 = [
+    websocks.Complete(websocks.Continuation(payload: <<0x07, 0x08>>)),
+    websocks.Complete(websocks.Ping(payload: <<"ping":utf8>>)),
+    websocks.Incomplete(websocks.Text(payload: <<"Frag":utf8>>)),
+    websocks.Incomplete(websocks.Continuation(payload: <<"ment":utf8>>)),
+  ]
+
+  let assert Ok(#(resolved3, context3)) =
+    websocks.resolve_fragments(batch3, context2)
+  assert resolved3
+    == [
+      websocks.Binary(payload: <<
+        0x01,
+        0x02,
+        0x03,
+        0x04,
+        0x05,
+        0x06,
+        0x07,
+        0x08,
+      >>),
+      websocks.Ping(payload: <<"ping":utf8>>),
+    ]
+  assert websocks.extract_accumulated_context_value(context3)
+    == Ok(websocks.Text(payload: <<"Fragment":utf8>>))
+
+  let batch4 = [
+    websocks.Incomplete(websocks.Continuation(payload: <<"ed":utf8>>)),
+    websocks.Incomplete(websocks.Continuation(payload: <<" Text":utf8>>)),
+  ]
+
+  let assert Ok(#(resolved4, context4)) =
+    websocks.resolve_fragments(batch4, context3)
+  assert resolved4 == []
+  assert websocks.extract_accumulated_context_value(context4)
+    == Ok(websocks.Text(payload: <<"Fragmented Text":utf8>>))
+
+  let batch5 = [
+    websocks.Complete(websocks.Continuation(payload: <<" Message":utf8>>)),
+    websocks.Complete(websocks.Text(payload: <<"Complete":utf8>>)),
+    websocks.Incomplete(websocks.Binary(payload: <<0xaa>>)),
+  ]
+
+  let assert Ok(#(resolved5, context5)) =
+    websocks.resolve_fragments(batch5, context4)
+  assert resolved5
+    == [
+      websocks.Text(payload: <<"Fragmented Text Message":utf8>>),
+      websocks.Text(payload: <<"Complete":utf8>>),
+    ]
+  assert websocks.extract_accumulated_context_value(context5)
+    == Ok(websocks.Binary(payload: <<0xaa>>))
+
+  let batch6 = [
+    websocks.Incomplete(websocks.Continuation(payload: <<0xbb, 0xcc>>)),
+    websocks.Incomplete(websocks.Continuation(payload: <<0xdd>>)),
+    websocks.Complete(websocks.Continuation(payload: <<0xee, 0xff>>)),
+    websocks.Complete(websocks.Pong(payload: <<"pong":utf8>>)),
+  ]
+
+  let assert Ok(#(resolved6, context6)) =
+    websocks.resolve_fragments(batch6, context5)
+  assert resolved6
+    == [
+      websocks.Binary(payload: <<0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff>>),
+      websocks.Pong(payload: <<"pong":utf8>>),
+    ]
+  assert context6 == websocks.create_context()
+
+  let batch7 = [
+    websocks.Incomplete(websocks.Text(payload: <<"Multi":utf8>>)),
+    websocks.Incomplete(websocks.Continuation(payload: <<"-":utf8>>)),
+    websocks.Incomplete(websocks.Continuation(payload: <<"part":utf8>>)),
+  ]
+
+  let assert Ok(#(resolved7, context7)) =
+    websocks.resolve_fragments(batch7, context6)
+  assert resolved7 == []
+  assert websocks.extract_accumulated_context_value(context7)
+    == Ok(websocks.Text(payload: <<"Multi-part":utf8>>))
+
+  let batch8 = [
+    websocks.Incomplete(websocks.Continuation(payload: <<" stream":utf8>>)),
+    websocks.Incomplete(websocks.Continuation(payload: <<" test":utf8>>)),
+    websocks.Complete(websocks.Continuation(payload: <<"!":utf8>>)),
+    websocks.Complete(
+      websocks.Close(websocks.NormalClosure(data: <<"done":utf8>>)),
+    ),
+  ]
+
+  let assert Ok(#(resolved8, context8)) =
+    websocks.resolve_fragments(batch8, context7)
+  assert resolved8
+    == [
+      websocks.Text(payload: <<"Multi-part stream test!":utf8>>),
+      websocks.Close(websocks.NormalClosure(data: <<"done":utf8>>)),
+    ]
+  assert context8 == websocks.create_context()
+}

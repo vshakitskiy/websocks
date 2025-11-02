@@ -355,6 +355,19 @@ pub opaque type Context {
   )
 }
 
+@internal
+pub fn extract_accumulated_context_value(context: Context) -> Result(Frame, Nil) {
+  case context {
+    Accumulating(frame_builder, accumulated_payload) ->
+      Ok(frame_builder(accumulated_payload))
+    Empty -> Error(Nil)
+  }
+}
+
+pub fn create_context() -> Context {
+  Empty
+}
+
 pub fn resolve_fragments(decoded_frames: List(DecodedFrame), context: Context) {
   do_resolve_fragments(decoded_frames, context, [])
 }
