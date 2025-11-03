@@ -69,10 +69,6 @@ type CompressionState {
   )
 }
 
-type CompressionConfig {
-  CompressionConfig(no_context_takeover: Bool)
-}
-
 type Flush {
   Sync
 }
@@ -538,118 +534,15 @@ pub opaque type Context {
   )
 }
 
-@internal
-pub fn extract_accumulated_context_value(context: Context) -> Result(Frame, Nil) {
-  case context {
-    Accumulating(
-      frame_builder,
-      accumulated_payload,
-      _compressed,
-      _compression_state,
-    ) -> Ok(frame_builder(accumulated_payload))
-    Empty(..) -> Error(Nil)
-  }
-}
-
-@internal
-pub fn is_empty_context(context: Context) -> Bool {
-  case context {
-    Empty(_) -> True
-    _ -> False
-  }
-}
-
-@internal
-pub fn make_complete(frame: Frame) -> DecodedFrame {
-  let internal = case frame {
-    Continuation(payload:) -> DecodedContinuation(payload:, compressed: False)
-    Text(payload:) -> DecodedText(payload:, compressed: False)
-    Binary(payload:) -> DecodedBinary(payload:, compressed: False)
-    Ping(payload:) -> DecodedPing(payload:)
-    Pong(payload:) -> DecodedPong(payload:)
-    Close(reason:) -> DecodedClose(reason:)
-  }
-  Complete(internal)
-}
-
-@internal
-pub fn make_incomplete(frame: Frame) -> DecodedFrame {
-  let internal = case frame {
-    Continuation(payload:) -> DecodedContinuation(payload:, compressed: False)
-    Text(payload:) -> DecodedText(payload:, compressed: False)
-    Binary(payload:) -> DecodedBinary(payload:, compressed: False)
-    Ping(payload:) -> DecodedPing(payload:)
-    Pong(payload:) -> DecodedPong(payload:)
-    Close(reason:) -> DecodedClose(reason:)
-  }
-  Incomplete(internal)
-}
-
-@internal
-pub fn make_complete_compressed_text(payload: BitArray) -> DecodedFrame {
-  Complete(DecodedText(payload:, compressed: True))
-}
-
-@internal
-pub fn make_complete_compressed_binary(payload: BitArray) -> DecodedFrame {
-  Complete(DecodedBinary(payload:, compressed: True))
-}
-
-@internal
-pub fn make_complete_compressed_continuation(payload: BitArray) -> DecodedFrame {
-  Complete(DecodedContinuation(payload:, compressed: True))
-}
-
-@internal
-pub fn make_incomplete_compressed_text(payload: BitArray) -> DecodedFrame {
-  Incomplete(DecodedText(payload:, compressed: True))
-}
-
-@internal
-pub fn make_incomplete_compressed_continuation(
-  payload: BitArray,
-) -> DecodedFrame {
-  Incomplete(DecodedContinuation(payload:, compressed: True))
-}
-
-@internal
-pub fn compress_payload_for_test(payload: BitArray) -> BitArray {
-  let state = init_compression(False)
-
-  case compress(state, payload) {
-    Ok(compressed) -> <<compressed:bits, 0x00, 0x00, 0xFF, 0xFF>>
-    Error(_) -> payload
-  }
-}
-
-@internal
-pub fn decoded_frame_eq(a: DecodedFrame, b: DecodedFrame) -> Bool {
-  case a, b {
-    Complete(DecodedContinuation(p1, c1)), Complete(DecodedContinuation(p2, c2))
-    -> p1 == p2 && c1 == c2
-    Complete(DecodedText(p1, c1)), Complete(DecodedText(p2, c2)) ->
-      p1 == p2 && c1 == c2
-    Complete(DecodedBinary(p1, c1)), Complete(DecodedBinary(p2, c2)) ->
-      p1 == p2 && c1 == c2
-    Complete(DecodedPing(p1)), Complete(DecodedPing(p2)) -> p1 == p2
-    Complete(DecodedPong(p1)), Complete(DecodedPong(p2)) -> p1 == p2
-    Complete(DecodedClose(r1)), Complete(DecodedClose(r2)) -> r1 == r2
-    Incomplete(DecodedContinuation(p1, c1)),
-      Incomplete(DecodedContinuation(p2, c2))
-    -> p1 == p2 && c1 == c2
-    Incomplete(DecodedText(p1, c1)), Incomplete(DecodedText(p2, c2)) ->
-      p1 == p2 && c1 == c2
-    Incomplete(DecodedBinary(p1, c1)), Incomplete(DecodedBinary(p2, c2)) ->
-      p1 == p2 && c1 == c2
-    Incomplete(DecodedPing(p1)), Incomplete(DecodedPing(p2)) -> p1 == p2
-    Incomplete(DecodedPong(p1)), Incomplete(DecodedPong(p2)) -> p1 == p2
-    Incomplete(DecodedClose(r1)), Incomplete(DecodedClose(r2)) -> r1 == r2
-    _, _ -> False
-  }
-}
-
 pub fn create_context(no_context_takeover: Bool) -> Context {
   Empty(init_compression(no_context_takeover))
+}
+
+pub fn close_context(context: Context) -> Nil {
+  case context {
+    Empty(compression_state) -> close_compression(compression_state)
+    Accumulating(..) -> Nil
+  }
 }
 
 pub fn resolve_fragments(decoded_frames: List(DecodedFrame), context: Context) {
@@ -797,4 +690,60 @@ fn decompress_payload(
 
   decompress(compression_state, payload)
   |> result.replace_error(DecompressionFailed)
+}
+
+// -----------------------------------------------------------------------------
+// For testing purposes only.
+// -----------------------------------------------------------------------------
+
+@internal
+pub fn extract_accumulated_context_value(context: Context) -> Result(Frame, Nil) {
+  case context {
+    Accumulating(
+      frame_builder,
+      accumulated_payload,
+      _compressed,
+      _compression_state,
+    ) -> Ok(frame_builder(accumulated_payload))
+    Empty(..) -> Error(Nil)
+  }
+}
+
+@internal
+pub fn is_empty_context(context: Context) -> Bool {
+  case context {
+    Empty(_) -> True
+    _ -> False
+  }
+}
+
+@internal
+pub fn to_decoded_frame(
+  frame: Frame,
+  final final: Bool,
+  compressed compressed: Bool,
+) -> DecodedFrame {
+  let internal = case frame {
+    Continuation(payload:) -> DecodedContinuation(payload:, compressed:)
+    Text(payload:) -> DecodedText(payload:, compressed:)
+    Binary(payload:) -> DecodedBinary(payload:, compressed:)
+    Ping(payload:) -> DecodedPing(payload:)
+    Pong(payload:) -> DecodedPong(payload:)
+    Close(reason:) -> DecodedClose(reason:)
+  }
+
+  case final {
+    True -> Complete(internal)
+    False -> Incomplete(internal)
+  }
+}
+
+@internal
+pub fn compress_payload(payload: BitArray) -> BitArray {
+  let state = init_compression(False)
+
+  case compress(state, payload) {
+    Ok(compressed) -> <<compressed:bits>>
+    Error(_) -> payload
+  }
 }
