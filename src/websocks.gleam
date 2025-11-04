@@ -505,6 +505,39 @@ pub fn close_context(context: Context) -> Nil {
   }
 }
 
+pub fn decode_many_frames(
+  data: BitArray,
+  context: Context,
+) -> Result(#(List(DecodedFrame), Context), Nil) {
+  do_decode_many_frames(<<context.buffer:bits, data:bits>>, context, [])
+}
+
+fn do_decode_many_frames(
+  data: BitArray,
+  context: Context,
+  decoded_frames: List(DecodedFrame),
+) -> Result(#(List(DecodedFrame), Context), Nil) {
+  case decode_frame(data) {
+    Ok(#(decoded_frame, <<>>)) ->
+      Ok(#(
+        list.reverse([decoded_frame, ..decoded_frames]),
+        update_buffer(context, <<>>),
+      ))
+    Ok(#(decoded_frame, rest)) ->
+      do_decode_many_frames(rest, context, [decoded_frame, ..decoded_frames])
+    Error(NotEnoughData(data)) ->
+      Ok(#(list.reverse(decoded_frames), update_buffer(context, data)))
+    Error(InvalidFrame) -> Error(Nil)
+  }
+}
+
+fn update_buffer(context: Context, data: BitArray) -> Context {
+  case context {
+    Empty(..) -> Empty(..context, buffer: data)
+    Accumulating(..) -> Accumulating(..context, buffer: data)
+  }
+}
+
 pub fn encode_text_frame(
   payload payload: BitArray,
   context context: Context,
@@ -718,6 +751,11 @@ pub fn is_empty_context(context: Context) -> Bool {
     Empty(..) -> True
     Accumulating(..) -> False
   }
+}
+
+@internal
+pub fn extract_buffer(context: Context) -> BitArray {
+  context.buffer
 }
 
 @internal
