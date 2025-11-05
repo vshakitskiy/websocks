@@ -1711,7 +1711,7 @@ pub fn resolve_context_preserved_incomplete_test() {
     websocks.resolve_fragments(frames, websocks.create_context(None))
 
   assert resolved == []
-  assert websocks.extract_accumulated_context_value(context)
+  assert websocks.extract_accumulating_frame(context)
     == Ok(websocks.Text(payload: <<"Hel":utf8>>))
 }
 
@@ -1984,7 +1984,7 @@ pub fn resolve_context_preserved_mid_fragmentation_test() {
     websocks.resolve_fragments(frames, websocks.create_context(None))
 
   assert resolved == []
-  assert websocks.extract_accumulated_context_value(context)
+  assert websocks.extract_accumulating_frame(context)
     == Ok(websocks.Text(payload: <<"Hello":utf8>>))
 
   let next_frames = [
@@ -2029,7 +2029,7 @@ pub fn resolve_stream_simulation_test() {
   let assert Ok(#(resolved1, context1)) =
     websocks.resolve_fragments(batch1, websocks.create_context(None))
   assert resolved1 == [websocks.Text(payload: <<"Message1":utf8>>)]
-  assert websocks.extract_accumulated_context_value(context1)
+  assert websocks.extract_accumulating_frame(context1)
     == Ok(websocks.Binary(payload: <<0x01, 0x02, 0x03>>))
 
   let batch2 = [
@@ -2048,7 +2048,7 @@ pub fn resolve_stream_simulation_test() {
   let assert Ok(#(resolved2, context2)) =
     websocks.resolve_fragments(batch2, context1)
   assert resolved2 == []
-  assert websocks.extract_accumulated_context_value(context2)
+  assert websocks.extract_accumulating_frame(context2)
     == Ok(websocks.Binary(payload: <<0x01, 0x02, 0x03, 0x04, 0x05, 0x06>>))
 
   let batch3 = [
@@ -2090,7 +2090,7 @@ pub fn resolve_stream_simulation_test() {
       >>),
       websocks.Ping(payload: <<"ping":utf8>>),
     ]
-  assert websocks.extract_accumulated_context_value(context3)
+  assert websocks.extract_accumulating_frame(context3)
     == Ok(websocks.Text(payload: <<"Fragment":utf8>>))
 
   let batch4 = [
@@ -2109,7 +2109,7 @@ pub fn resolve_stream_simulation_test() {
   let assert Ok(#(resolved4, context4)) =
     websocks.resolve_fragments(batch4, context3)
   assert resolved4 == []
-  assert websocks.extract_accumulated_context_value(context4)
+  assert websocks.extract_accumulating_frame(context4)
     == Ok(websocks.Text(payload: <<"Fragmented Text":utf8>>))
 
   let batch5 = [
@@ -2137,7 +2137,7 @@ pub fn resolve_stream_simulation_test() {
       websocks.Text(payload: <<"Fragmented Text Message":utf8>>),
       websocks.Text(payload: <<"Complete":utf8>>),
     ]
-  assert websocks.extract_accumulated_context_value(context5)
+  assert websocks.extract_accumulating_frame(context5)
     == Ok(websocks.Binary(payload: <<0xaa>>))
 
   let batch6 = [
@@ -2193,7 +2193,7 @@ pub fn resolve_stream_simulation_test() {
   let assert Ok(#(resolved7, context7)) =
     websocks.resolve_fragments(batch7, context6)
   assert resolved7 == []
-  assert websocks.extract_accumulated_context_value(context7)
+  assert websocks.extract_accumulating_frame(context7)
     == Ok(websocks.Text(payload: <<"Multi-part":utf8>>))
 
   let batch8 = [

@@ -175,14 +175,14 @@ fn init_compression(no_client: Bool, no_server: Bool) -> Compression {
 fn compress(state: Compression, payload: BitArray) -> BitArray {
   case state {
     Disabled -> payload
-    Enabled(_, defalte_context, _, no_server) -> {
+    Enabled(_, deflate_context, _, no_server) -> {
       let compressed =
-        do_deflate(defalte_context, payload, Sync)
+        do_deflate(deflate_context, payload, Sync)
         |> bytes_tree.to_bit_array()
 
       case no_server {
         True -> {
-          deflate_reset(defalte_context)
+          deflate_reset(deflate_context)
           Nil
         }
         False -> Nil
@@ -225,6 +225,64 @@ fn close_compression(state: Compression) -> Nil {
 }
 
 // -----------------------------------------------------------------------------
+// Context
+// -----------------------------------------------------------------------------
+
+pub opaque type Context {
+  Empty(compression: Compression, buffer: BitArray)
+  Accumulating(
+    compression: Compression,
+    buffer: BitArray,
+    frame_builder: fn(BitArray) -> Frame,
+    accumulated_payload: BitArray,
+    compressed: Bool,
+  )
+}
+
+pub fn create_context(compression: Option(ContextTakeover)) -> Context {
+  case compression {
+    Some(ContextTakeover(no_client, no_server)) ->
+      Empty(compression: init_compression(no_client, no_server), buffer: <<>>)
+    None -> Empty(compression: Disabled, buffer: <<>>)
+  }
+}
+
+pub fn close_context(context: Context) -> Nil {
+  case context {
+    Empty(compression, _buffer) -> close_compression(compression)
+    Accumulating(..) -> Nil
+  }
+}
+
+fn update_buffer(context: Context, data: BitArray) -> Context {
+  case context {
+    Empty(..) -> Empty(..context, buffer: data)
+    Accumulating(..) -> Accumulating(..context, buffer: data)
+  }
+}
+
+fn apply_compression(
+  compression: Option(Compression),
+  payload: BitArray,
+) -> BitArray {
+  case compression {
+    Some(Enabled(..) as compression) -> compress(compression, payload)
+    _ -> payload
+  }
+}
+
+fn apply_decompression(
+  compression: Compression,
+  payload: BitArray,
+  compressed: Bool,
+) {
+  case compressed {
+    True -> decompress(compression, payload)
+    False -> payload
+  }
+}
+
+// -----------------------------------------------------------------------------
 // Frames
 // -----------------------------------------------------------------------------
 
@@ -261,6 +319,32 @@ type InternalFrame {
   DecodedPing(payload: BitArray)
   DecodedPong(payload: BitArray)
   DecodedClose(reason: CloseReason)
+}
+
+fn internal_frame_to_frame(
+  internal_frame: InternalFrame,
+  compression: Compression,
+) -> Result(Frame, ResolveError) {
+  case internal_frame {
+    DecodedContinuation(payload:, compressed:) -> {
+      Ok(
+        Continuation(payload: apply_decompression(
+          compression,
+          payload,
+          compressed,
+        )),
+      )
+    }
+    DecodedText(payload:, compressed:) -> {
+      Ok(Text(payload: apply_decompression(compression, payload, compressed)))
+    }
+    DecodedBinary(payload:, compressed:) -> {
+      Ok(Binary(payload: apply_decompression(compression, payload, compressed)))
+    }
+    DecodedPing(payload:) -> Ok(Ping(payload:))
+    DecodedPong(payload:) -> Ok(Pong(payload:))
+    DecodedClose(reason:) -> Ok(Close(reason:))
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -385,6 +469,32 @@ pub fn decode_frame(
   }
 }
 
+pub fn decode_many_frames(
+  data: BitArray,
+  context: Context,
+) -> Result(#(List(DecodedFrame), Context), Nil) {
+  do_decode_many_frames(<<context.buffer:bits, data:bits>>, context, [])
+}
+
+fn do_decode_many_frames(
+  data: BitArray,
+  context: Context,
+  decoded_frames: List(DecodedFrame),
+) -> Result(#(List(DecodedFrame), Context), Nil) {
+  case decode_frame(data) {
+    Ok(#(decoded_frame, <<>>)) ->
+      Ok(#(
+        list.reverse([decoded_frame, ..decoded_frames]),
+        update_buffer(context, <<>>),
+      ))
+    Ok(#(decoded_frame, rest)) ->
+      do_decode_many_frames(rest, context, [decoded_frame, ..decoded_frames])
+    Error(NotEnoughData(data)) ->
+      Ok(#(list.reverse(decoded_frames), update_buffer(context, data)))
+    Error(InvalidFrame) -> Error(Nil)
+  }
+}
+
 // -----------------------------------------------------------------------------
 // Encoding
 // -----------------------------------------------------------------------------
@@ -465,79 +575,6 @@ fn encode_frame(
   >>
 }
 
-fn apply_compression(
-  compression: Option(Compression),
-  payload: BitArray,
-) -> BitArray {
-  case compression {
-    Some(Enabled(..) as compression) -> compress(compression, payload)
-    _ -> payload
-  }
-}
-
-// -----------------------------------------------------------------------------
-// Context
-// -----------------------------------------------------------------------------
-
-pub opaque type Context {
-  Empty(compression: Compression, buffer: BitArray)
-  Accumulating(
-    compression: Compression,
-    buffer: BitArray,
-    frame_builder: fn(BitArray) -> Frame,
-    accumulated_payload: BitArray,
-    compressed: Bool,
-  )
-}
-
-pub fn create_context(compression: Option(ContextTakeover)) -> Context {
-  case compression {
-    Some(ContextTakeover(no_client, no_server)) ->
-      Empty(compression: init_compression(no_client, no_server), buffer: <<>>)
-    None -> Empty(compression: Disabled, buffer: <<>>)
-  }
-}
-
-pub fn close_context(context: Context) -> Nil {
-  case context {
-    Empty(compression, _buffer) -> close_compression(compression)
-    Accumulating(..) -> Nil
-  }
-}
-
-pub fn decode_many_frames(
-  data: BitArray,
-  context: Context,
-) -> Result(#(List(DecodedFrame), Context), Nil) {
-  do_decode_many_frames(<<context.buffer:bits, data:bits>>, context, [])
-}
-
-fn do_decode_many_frames(
-  data: BitArray,
-  context: Context,
-  decoded_frames: List(DecodedFrame),
-) -> Result(#(List(DecodedFrame), Context), Nil) {
-  case decode_frame(data) {
-    Ok(#(decoded_frame, <<>>)) ->
-      Ok(#(
-        list.reverse([decoded_frame, ..decoded_frames]),
-        update_buffer(context, <<>>),
-      ))
-    Ok(#(decoded_frame, rest)) ->
-      do_decode_many_frames(rest, context, [decoded_frame, ..decoded_frames])
-    Error(NotEnoughData(data)) ->
-      Ok(#(list.reverse(decoded_frames), update_buffer(context, data)))
-    Error(InvalidFrame) -> Error(Nil)
-  }
-}
-
-fn update_buffer(context: Context, data: BitArray) -> Context {
-  case context {
-    Empty(..) -> Empty(..context, buffer: data)
-    Accumulating(..) -> Accumulating(..context, buffer: data)
-  }
-}
-
 pub fn encode_text_frame(
   payload payload: BitArray,
   context context: Context,
@@ -584,6 +621,10 @@ pub fn encode_close_frame(
 ) -> BitArray {
   encode_frame(Close(reason:), final: True, compression: None, masking:)
 }
+
+// -----------------------------------------------------------------------------
+// Resolving fragments
+// -----------------------------------------------------------------------------
 
 pub type ResolveError {
   NotUtf8
@@ -695,49 +736,14 @@ fn do_resolve_fragments(
   }
 }
 
-fn internal_frame_to_frame(
-  internal_frame: InternalFrame,
-  compression: Compression,
-) -> Result(Frame, ResolveError) {
-  case internal_frame {
-    DecodedContinuation(payload:, compressed:) -> {
-      Ok(
-        Continuation(payload: apply_decompression(
-          compression,
-          payload,
-          compressed,
-        )),
-      )
-    }
-    DecodedText(payload:, compressed:) -> {
-      Ok(Text(payload: apply_decompression(compression, payload, compressed)))
-    }
-    DecodedBinary(payload:, compressed:) -> {
-      Ok(Binary(payload: apply_decompression(compression, payload, compressed)))
-    }
-    DecodedPing(payload:) -> Ok(Ping(payload:))
-    DecodedPong(payload:) -> Ok(Pong(payload:))
-    DecodedClose(reason:) -> Ok(Close(reason:))
-  }
-}
-
-fn apply_decompression(
-  compression: Compression,
-  payload: BitArray,
-  compressed: Bool,
-) {
-  case compressed {
-    True -> decompress(compression, payload)
-    False -> payload
-  }
-}
-
 // -----------------------------------------------------------------------------
-// For testing purposes only.
+// Testing
 // -----------------------------------------------------------------------------
+// NOTE: These functions are for internal use only, and are used in test 
+// suites. Do NOT use them in your own code.
 
 @internal
-pub fn extract_accumulated_context_value(context: Context) -> Result(Frame, Nil) {
+pub fn extract_accumulating_frame(context: Context) -> Result(Frame, Nil) {
   case context {
     Accumulating(frame_builder:, accumulated_payload:, ..) ->
       Ok(frame_builder(accumulated_payload))
@@ -746,16 +752,16 @@ pub fn extract_accumulated_context_value(context: Context) -> Result(Frame, Nil)
 }
 
 @internal
+pub fn extract_buffer(context: Context) -> BitArray {
+  context.buffer
+}
+
+@internal
 pub fn is_empty_context(context: Context) -> Bool {
   case context {
     Empty(..) -> True
     Accumulating(..) -> False
   }
-}
-
-@internal
-pub fn extract_buffer(context: Context) -> BitArray {
-  context.buffer
 }
 
 @internal
