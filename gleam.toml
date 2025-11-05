@@ -1,7 +1,7 @@
 name = "websocks"
 version = "1.0.0"
 description = "🧦 WebSocket protocol in Gleam"
-lisences = ["Apache-2.0"]
+licences = ["Apache-2.0"]
 target = "erlang"
 repository = { type = "github", user = "vshakitskiy", repo = "websocks" }
 
