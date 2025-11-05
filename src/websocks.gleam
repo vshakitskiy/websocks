@@ -1,9 +1,72 @@
+//// <script>
+//// // https://gitlab.com/arkandos/smol/-/blob/main/src/smol.gleam?ref_type=heads
+//// (callback => document.readyState !== 'loading' ? callback() : document.addEventListener('DOMContentLoaded', callback, { once: true }))(() => {
+////   const docsIndex = [
+////     {
+////       header: "Handshake",
+////       functions: ["magic_string", "compute_accept", "has_deflate", "get_context_takeovers"]
+////     },
+////     {
+////       header: "Masking",
+////       functions: ["mask"]
+////     },
+////     {
+////       header: "Context",
+////       functions: ["create_context", "close_context"]
+////     },
+////     {
+////       header: "Decoding",
+////       functions: ["decode_frame", "decode_many_frames"]
+////     },
+////     {
+////       header: "Encoding",
+////       functions: ["encode_text_frame", "encode_binary_frame", "encode_ping_frame", "encode_pong_frame", "encode_close_frame"]
+////     },
+////     {
+////       header: "Resolving fragments",
+////       functions: ["resolve_fragments"]
+////     }
+////   ];
+////
+////   const list = document.querySelector('.sidebar > ul:last-of-type')
+////   const sortedLists = document.createDocumentFragment()
+////   const sortedMembers = document.createDocumentFragment()
+////
+////   for (const section of docsIndex) {
+////     sortedLists.append((() => {
+////       const node = document.createElement('h3')
+////       node.append(section.header)
+////       return node
+////     })())
+////     sortedMembers.append((() => {
+////       const node = document.createElement('h2')
+////       node.append(section.header)
+////       return node
+////     })())
+////
+////     const sortedList = document.createElement('ul')
+////     sortedLists.append(sortedList)
+////
+////     const sortedFunctions = [...section.functions].sort()
+////
+////     for (const funcName of sortedFunctions) {
+////       const href = `#${funcName}`
+////       const member = document.querySelector(`.member:has(h2 > a[href="${href}"])`)
+////       const sidebar = list.querySelector(`li:has(a[href="${href}"])`)
+////       sortedList.append(sidebar)
+////       sortedMembers.append(member)
+////     }
+////   }
+////
+////   document.querySelector('.sidebar').insertBefore(sortedLists, list)
+////   document.querySelector('.module-members:has(#module-values)').insertBefore(sortedMembers, document.querySelector('#module-values').nextSibling)
+//// })
+//// </script>
+
 // TODO:
 // pub fn begin_fragmentation(...)
 // pub fn continue_fragmentation(...)
 // pub fn finish_fragmentation(...)
-
-// TODO: comments for internal functions
 
 import gleam/bit_array
 import gleam/bool
@@ -124,9 +187,6 @@ pub fn mask(payload: BitArray, mask: BitArray) -> BitArray {
   |> exor(payload, _)
 }
 
-@external(erlang, "crypto", "exor")
-fn exor(bin1: BitArray, bin2: BitArray) -> BitArray
-
 fn repeat_mask(mask: BitArray, payload_length: Int) -> BitArray {
   let mask_length = bit_array.byte_size(mask)
 
@@ -150,6 +210,9 @@ fn repeat_mask(mask: BitArray, payload_length: Int) -> BitArray {
     }
   }
 }
+
+@external(erlang, "crypto", "exor")
+fn exor(bin1: BitArray, bin2: BitArray) -> BitArray
 
 @external(erlang, "binary", "copy")
 fn copy(subject: BitArray, n: Int) -> BitArray
@@ -339,10 +402,7 @@ pub fn create_context(compression: Option(ContextTakeover)) -> Context {
 /// ```
 /// 
 pub fn close_context(context: Context) -> Nil {
-  case context {
-    Empty(compression, _buffer) -> close_compression(compression)
-    Accumulating(..) -> Nil
-  }
+  close_compression(context.compression)
 }
 
 fn update_buffer(context: Context, data: BitArray) -> Context {
@@ -489,21 +549,28 @@ pub type DecodeError {
 /// ### Example
 /// 
 /// ```gleam
-/// // Frame parts:
 /// // 0x81 : fin=1, rsv1-3=0, opcode=1
 /// // 0x05 : mask=0, payload length=5
 /// let frame = <<0x81, 0x05>>
 /// // 0x48 0x65 0x6c 0x6c 0x6f : "Hello"
 /// let payload = <<0x48, 0x65, 0x6c, 0x6c, 0x6f>>
 ///
-/// // Let's say we have this buffer:
+/// // Let's assume we have this buffer:
 /// let buffer = <<frame:bits, payload:bits, frame:bits>>
 ///
+/// // The first frame is decoded, and the remaining binary is returned.
 /// let decoded = websocks.decode_frame(buffer)
 /// // => Ok(#(DecodedFrame, <<129, 5>>))
 ///
-/// result.try(decoded, fn(decoded) { websocks.decode_frame(decoded.1) })
+/// let assert Ok(#(_decoded_frame, rest)) = decoded
+///
+/// // Remaining binary is not enough to decode the frame.
+/// websocks.decode_frame(rest)
 /// // => Error(NotEnoughData(<<129, 5>>))
+///
+/// // If we add the remaining payload to the buffer, the frame is decoded.
+/// websocks.decode_frame(<<rest:bits, payload:bits>>)
+/// // => Ok(#(DecodedFrame, <<>>))
 /// ```
 ///  
 pub fn decode_frame(
@@ -619,7 +686,6 @@ pub fn decode_frame(
 /// ### Example
 /// 
 /// ```gleam
-/// // Frame parts:
 /// // 0x81 : fin=1, rsv1-3=0, opcode=1
 /// // 0x04 : mask=0, payload length=4
 /// let frame = <<0x81, 0x04>>
@@ -629,8 +695,8 @@ pub fn decode_frame(
 /// let payload2 = <<0x6f, 0x20, 0x57, 0x6f>>
 /// // 0x72 0x6c 0x64 0x21 : "rld!"
 /// let payload3 = <<0x72, 0x6c, 0x64, 0x21>>
-/// 
-/// // Let's say we have this buffer:
+///
+/// // Let's assume we have this buffer:
 /// let frames = <<
 ///   frame:bits,
 ///   payload1:bits,
@@ -639,16 +705,16 @@ pub fn decode_frame(
 ///   frame:bits,
 /// >>
 ///
-/// // Context is used to store the remaining bytes after decoding.
+/// // The context is used to store the remaining bytes after decoding.
 /// let context = websocks.create_context(None)
-/// 
+///
 /// let decoded = websocks.decode_many_frames(frames, context)
 /// // => Ok(#([DecodedFrame, DecodedFrame], Context: <<0x81, 0x04>>))
-/// 
-/// result.try(decoded, fn(decoded) {
-///   // We can try to decode the remaining frames using updated context.
-///   websocks.decode_many_frames(payload3, decoded.1)
-/// })
+///
+/// let assert Ok(#(_decoded_frames, updated_context)) = decoded
+///
+/// // We can try to decode the remaining frames using the updated context.
+/// websocks.decode_many_frames(payload3, updated_context)
 /// // => Ok(#([DecodedFrame], Context: <<>>))
 /// ```
 /// 
@@ -841,7 +907,6 @@ pub type ResolveError {
 /// ### Example
 /// 
 /// ```gleam
-/// // Frame parts:
 /// // Incomplete text frame:
 /// // 0x01 : fin=0, rsv1-3=0, opcode=1
 /// // 0x04 : mask=0, payload length=4
@@ -860,7 +925,7 @@ pub type ResolveError {
 /// // 0x72 0x6c 0x64 0x21 : "rld!"
 /// let payload3 = <<0x72, 0x6c, 0x64, 0x21>>
 ///
-/// // Let's say we have this buffer:
+/// // Let's assume we have this buffer:
 /// let frames = <<
 ///   text:bits,
 ///   payload1:bits,
@@ -872,13 +937,13 @@ pub type ResolveError {
 ///
 /// let context = websocks.create_context(None)
 /// 
-/// // We assume that the frames were successfully decoded.
+/// // We assume that the frames have been successfully decoded.
 /// let assert Ok(#(decoded_frames, context)) =
 ///   websocks.decode_many_frames(frames, context)
 /// 
-/// // Resolve the decoded frames
+/// // Resolve the decoded frames.
 /// websocks.resolve_fragments(decoded_frames, context)
-/// // => Ok(#([Text("Hello World!")], Context)
+/// // => Ok(#([Text("Hello World!")], Context))
 /// ```
 /// 
 pub fn resolve_fragments(
