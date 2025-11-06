@@ -33,6 +33,10 @@
 ////   {
 ////     header: "Resolving fragments",
 ////     functions: ["resolve_fragments"]
+////   },
+////   {
+////     header: "Processing",
+////     functions: ["process_incoming_frames"]
 ////   }
 //// ]
 //// 
@@ -1111,27 +1115,88 @@ fn do_resolve_fragments(
   }
 }
 
+/// Represents an instruction, indicating whether to continue processing
+/// more frames or stop. Used by the frame handler in `process_incoming_frames`
+/// to control the processing flow.
 pub type ResolveNext(state) {
+  /// Continue processing more frames with the updated state.
   Continue(state: state)
+  /// Stop processing frames and return the updated state. Remaining data will
+  /// be stored in the context buffer for the next processing call.
   Stop(state: state)
 }
 
+/// Errors that can occur during the frame processing in 
+/// `process_incoming_frames`.
 pub type ProcessError {
+  /// Frame decoding failed with the given decode error.
   DecodeFailed(reason: DecodeError)
+  /// Frame resolution failed with the given resolve error.
   ResolveFailed(reason: ResolveError)
 }
 
-pub fn process_incomming_frames(
+/// Processes incoming WebSocket frames from the given data. This function 
+/// combines the context buffer with the new data, decodes frames, resolves 
+/// fragments, and calls the handler function for each resolved frame. The 
+/// handler returns `ResolveNext` to control the processing flow. If there's not 
+/// enough data to decode a complete frame, the remaining data is stored in the 
+/// context buffer for the next call.
+///
+/// ### Example
+/// 
+/// ```gleam
+/// // 0x81 : fin=1, rsv1-3=0, opcode=1
+/// // 0x05 : mask=0, payload length=5
+/// let frame = <<0x81, 0x05>>
+/// // 0x48 0x65 0x6c 0x6c 0x6f : "Hello"
+/// let payload = <<0x48, 0x65, 0x6c, 0x6c, 0x6f>>
+///
+/// // let's assume we have this buffer:
+/// let data = <<frame:bits, payload:bits, frame:bits>>
+///
+/// let context = websocks.create_context(None)
+/// let initial_state = 0
+///
+/// // Handler that collects all text frames
+/// let handler = fn(state, _context, frame) {
+///   case frame {
+///     websocks.Continuation(payload) ->
+///       echo #("received continuation frame", payload)
+///     websocks.Text(payload) -> echo #("received text frame", payload)
+///     websocks.Binary(payload) -> echo #("received binary frame", payload)
+///     websocks.Control(websocks.Ping(payload)) ->
+///       echo #("received ping frame", payload)
+///     websocks.Control(websocks.Pong(payload)) ->
+///       echo #("received pong frame", payload)
+///     websocks.Control(websocks.Close(reason)) ->
+///       echo #(
+///         "received close frame",
+///         bit_array.from_string(string.inspect(reason)),
+///       )
+///   }
+///
+///   websocks.Continue(state + 1)
+/// }
+///
+/// let processed =
+///   websocks.process_incoming_frames(data, context, initial_state, handler)
+///   // => #("received text frame", "Hello")
+///
+/// echo processed
+/// // => Ok(#(1, context: <<0x81, 0x05>>))
+/// ```
+/// 
+pub fn process_incoming_frames(
   data: BitArray,
   context: Context,
   state: state,
   handler: fn(state, Context, Frame) -> ResolveNext(state),
 ) {
   let data = <<context.buffer:bits, data:bits>>
-  do_process_incomming_frames(data, context, state, handler)
+  do_process_incoming_frames(data, context, state, handler)
 }
 
-fn do_process_incomming_frames(
+fn do_process_incoming_frames(
   data: BitArray,
   context: Context,
   state: state,
@@ -1146,7 +1211,7 @@ fn do_process_incomming_frames(
           case rest {
             <<>> -> Ok(#(new_state, update_buffer(new_context, <<>>)))
             _ ->
-              do_process_incomming_frames(rest, new_context, new_state, handler)
+              do_process_incoming_frames(rest, new_context, new_state, handler)
           }
         Ok(#(Stop(new_state), new_context)) ->
           Ok(#(new_state, update_buffer(new_context, rest)))
@@ -1290,13 +1355,21 @@ pub fn to_decoded_frame(
   final final: Bool,
   compressed compressed: Bool,
 ) -> DecodedFrame {
-  let internal = case frame {
-    Continuation(payload:) -> DecodedContinuation(payload:, compressed:)
-    Text(payload:) -> DecodedText(payload:, compressed:)
-    Binary(payload:) -> DecodedBinary(payload:, compressed:)
-    Control(control:) -> DecodedControl(control:)
+  case frame {
+    Continuation(payload:) ->
+      DecodedContinuation(payload:, compressed:)
+      |> wrap_decoded_frame(final)
+    Text(payload:) ->
+      DecodedText(payload:, compressed:)
+      |> wrap_decoded_frame(final)
+    Binary(payload:) ->
+      DecodedBinary(payload:, compressed:)
+      |> wrap_decoded_frame(final)
+    Control(control:) -> Resolved(Control(control:))
   }
+}
 
+fn wrap_decoded_frame(internal: InternalFrame, final: Bool) -> DecodedFrame {
   case final {
     True -> Complete(internal)
     False -> Incomplete(internal)
