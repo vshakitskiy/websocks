@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.0.0 - 06.11.2025
 
 - Compression handles closing bytes
 - Control frames are separated with `Control` type

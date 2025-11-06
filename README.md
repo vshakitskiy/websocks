@@ -8,7 +8,7 @@ Utility package for building WebSocket server/client in Gleam.
 ## Installation
 
 ```sh
-gleam add websocks@1
+gleam add websocks@2
 ```
 
 ## API Reference
