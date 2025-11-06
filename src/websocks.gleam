@@ -331,8 +331,15 @@ fn compress(state: Compression, payload: BitArray) -> BitArray {
     Disabled -> payload
     Enabled(_, deflate_context, _, no_server) -> {
       let compressed =
-        do_deflate(deflate_context, payload, Sync)
+        do_deflate(deflate_context, <<payload:bits>>, Sync)
         |> bytes_tree.to_bit_array()
+
+      let size = bit_array.byte_size(compressed) - 4
+
+      let compressed = case compressed {
+        <<compressed:bytes-size(size), 0x00, 0x00, 0xff, 0xff>> -> compressed
+        _ -> compressed
+      }
 
       case no_server {
         True -> {
@@ -352,7 +359,8 @@ fn decompress(state: Compression, payload: BitArray) -> BitArray {
     Disabled -> payload
     Enabled(inflate_context, _, no_client, _) -> {
       let decompressed =
-        do_inflate(inflate_context, payload) |> bytes_tree.to_bit_array()
+        do_inflate(inflate_context, <<payload:bits, 0x00, 0x00, 0xff, 0xff>>)
+        |> bytes_tree.to_bit_array()
 
       case no_client {
         True -> {
@@ -470,6 +478,12 @@ pub type Frame {
   Text(payload: BitArray)
   /// A binary frame, containing arbitrary binary data.
   Binary(payload: BitArray)
+  /// A control frame, controlling WebSocket connection.
+  Control(control: Control)
+}
+
+/// Control frames that can appear in WebSocket communication.
+pub type Control {
   /// A ping control frame. Used for keepalive.
   Ping(payload: BitArray)
   /// A pong control frame. Response to ping.
@@ -510,40 +524,36 @@ pub type CloseReason {
   TLSHandshake(data: BitArray)
   /// Custom close codes for application-specific use cases.
   CustomCloseCode(code: Int, data: BitArray)
+  /// No close reason.
+  NoCloseReason
 }
 
 type InternalFrame {
   DecodedContinuation(payload: BitArray, compressed: Bool)
   DecodedText(payload: BitArray, compressed: Bool)
   DecodedBinary(payload: BitArray, compressed: Bool)
-  DecodedPing(payload: BitArray)
-  DecodedPong(payload: BitArray)
-  DecodedClose(reason: CloseReason)
+  DecodedControl(control: Control)
 }
 
 fn internal_frame_to_frame(
   internal_frame: InternalFrame,
   compression: Compression,
-) -> Result(Frame, ResolveError) {
+) -> Frame {
   case internal_frame {
-    DecodedContinuation(payload:, compressed:) -> {
-      Ok(
-        Continuation(payload: apply_decompression(
-          compression,
-          payload,
-          compressed,
-        )),
-      )
-    }
-    DecodedText(payload:, compressed:) -> {
-      Ok(Text(payload: apply_decompression(compression, payload, compressed)))
-    }
-    DecodedBinary(payload:, compressed:) -> {
-      Ok(Binary(payload: apply_decompression(compression, payload, compressed)))
-    }
-    DecodedPing(payload:) -> Ok(Ping(payload:))
-    DecodedPong(payload:) -> Ok(Pong(payload:))
-    DecodedClose(reason:) -> Ok(Close(reason:))
+    DecodedContinuation(payload:, compressed:) ->
+      Continuation(payload: apply_decompression(
+        compression,
+        payload,
+        compressed,
+      ))
+
+    DecodedText(payload:, compressed:) ->
+      Text(payload: apply_decompression(compression, payload, compressed))
+
+    DecodedBinary(payload:, compressed:) ->
+      Binary(payload: apply_decompression(compression, payload, compressed))
+
+    DecodedControl(control:) -> Control(control:)
   }
 }
 
@@ -599,19 +609,27 @@ pub type DecodeError {
 ///  
 pub fn decode_frame(
   data: BitArray,
+  context: Context,
 ) -> Result(#(DecodedFrame, BitArray), DecodeError) {
   case data {
     <<
       fin:1,
       rsv1:1,
-      _rsv2:1,
-      _rsv3:1,
+      rsv2:1,
+      rsv3:1,
       opcode:size(4),
       mask:1,
       payload_length:size(7),
       rest:bits,
     >> -> {
       let compressed = rsv1 == 1
+
+      use _nil <- result.try(case compressed, context.compression {
+        True, Disabled(..) -> Error(InvalidFrame)
+        _, _ -> Ok(Nil)
+      })
+
+      use <- bool.guard(rsv2 == 1 || rsv3 == 1, return: Error(InvalidFrame))
 
       // Decoding payload length
 
@@ -658,43 +676,45 @@ pub fn decode_frame(
         1 -> Ok(DecodedText(payload:, compressed:))
         2 -> Ok(DecodedBinary(payload:, compressed:))
         8 -> {
-          // TODO: Proper close code validation.
           case payload {
-            <<1000:size(16), data:bits>> ->
-              Ok(DecodedClose(NormalClosure(data:)))
-            <<1001:size(16), data:bits>> -> Ok(DecodedClose(GoingAway(data:)))
-            <<1002:size(16), data:bits>> ->
-              Ok(DecodedClose(ProtocolError(data:)))
-            <<1003:size(16), data:bits>> ->
-              Ok(DecodedClose(UnsupportedData(data:)))
-            <<1007:size(16), data:bits>> ->
-              Ok(DecodedClose(InvalidPayloadData(data:)))
-            <<1008:size(16), data:bits>> ->
-              Ok(DecodedClose(PolicyViolation(data:)))
-            <<1009:size(16), data:bits>> ->
-              Ok(DecodedClose(MessageTooBig(data:)))
-            <<1010:size(16), data:bits>> ->
-              Ok(DecodedClose(MandatoryExtension(data:)))
-            <<1011:size(16), data:bits>> ->
-              Ok(DecodedClose(InternalError(data:)))
-            <<1012:size(16), data:bits>> ->
-              Ok(DecodedClose(ServiceRestart(data:)))
-            <<1013:size(16), data:bits>> ->
-              Ok(DecodedClose(TryAgainLater(data:)))
-            <<1014:size(16), data:bits>> -> Ok(DecodedClose(BadGateway(data:)))
-            <<1015:size(16), data:bits>> ->
-              Ok(DecodedClose(TLSHandshake(data:)))
-            <<code:size(16), data:bits>> ->
-              Ok(DecodedClose(CustomCloseCode(code:, data:)))
+            <<>> -> Ok(DecodedControl(Close(NoCloseReason)))
+            <<code:size(16), data:bits>> -> {
+              use <- bool.guard(
+                when: !bit_array.is_utf8(data),
+                return: Error(InvalidFrame),
+              )
+
+              case code {
+                1000 -> Ok(DecodedControl(Close(NormalClosure(data:))))
+                1001 -> Ok(DecodedControl(Close(GoingAway(data:))))
+                1002 -> Ok(DecodedControl(Close(ProtocolError(data:))))
+                1003 -> Ok(DecodedControl(Close(UnsupportedData(data:))))
+                1007 -> Ok(DecodedControl(Close(InvalidPayloadData(data:))))
+                1008 -> Ok(DecodedControl(Close(PolicyViolation(data:))))
+                1009 -> Ok(DecodedControl(Close(MessageTooBig(data:))))
+                1010 -> Ok(DecodedControl(Close(MandatoryExtension(data:))))
+                1011 -> Ok(DecodedControl(Close(InternalError(data:))))
+                1012 -> Ok(DecodedControl(Close(ServiceRestart(data:))))
+                1013 -> Ok(DecodedControl(Close(TryAgainLater(data:))))
+                1014 -> Ok(DecodedControl(Close(BadGateway(data:))))
+                1015 -> Ok(DecodedControl(Close(TLSHandshake(data:))))
+                code if code >= 3000 && code <= 4999 ->
+                  Ok(DecodedControl(Close(CustomCloseCode(code:, data:))))
+                _ -> Error(InvalidFrame)
+              }
+            }
             _ -> Error(InvalidFrame)
           }
         }
-        9 -> Ok(DecodedPing(payload:))
-        10 -> Ok(DecodedPong(payload:))
+        9 -> Ok(DecodedControl(Ping(payload:)))
+        10 -> Ok(DecodedControl(Pong(payload:)))
         _ -> Error(InvalidFrame)
       }
 
       case fin, frame {
+        1, Ok(DecodedControl(control:)) ->
+          Ok(#(Resolved(Control(control:)), rest))
+        0, Ok(DecodedControl(_)) -> Error(InvalidFrame)
         1, Ok(frame) -> Ok(#(Complete(frame), rest))
         0, Ok(frame) -> Ok(#(Incomplete(frame), rest))
         _, _ -> Error(InvalidFrame)
@@ -754,7 +774,7 @@ fn do_decode_many_frames(
   context: Context,
   decoded_frames: List(DecodedFrame),
 ) -> Result(#(List(DecodedFrame), Context), Nil) {
-  case decode_frame(data) {
+  case decode_frame(data, context) {
     Ok(#(decoded_frame, <<>>)) ->
       Ok(#(
         list.reverse([decoded_frame, ..decoded_frames]),
@@ -782,10 +802,11 @@ fn encode_frame(
     Continuation(payload) -> #(0, payload)
     Text(payload) -> #(1, apply_compression(compression, payload))
     Binary(payload) -> #(2, apply_compression(compression, payload))
-    Ping(payload) -> #(9, payload)
-    Pong(payload) -> #(10, payload)
-    Close(reason) -> {
+    Control(Ping(payload)) -> #(9, payload)
+    Control(Pong(payload)) -> #(10, payload)
+    Control(Close(reason)) -> {
       let payload = case reason {
+        NoCloseReason -> <<>>
         NormalClosure(data) -> <<1000:size(16), data:bits>>
         GoingAway(data) -> <<1001:size(16), data:bits>>
         ProtocolError(data) -> <<1002:size(16), data:bits>>
@@ -883,7 +904,12 @@ pub fn encode_ping_frame(
   payload payload: BitArray,
   masking masking: Option(BitArray),
 ) -> BitArray {
-  encode_frame(Ping(payload:), final: True, compression: None, masking:)
+  encode_frame(
+    Control(Ping(payload:)),
+    final: True,
+    compression: None,
+    masking:,
+  )
 }
 
 /// Encodes a pong frame with the given payload and mask.
@@ -891,7 +917,12 @@ pub fn encode_pong_frame(
   payload payload: BitArray,
   masking masking: Option(BitArray),
 ) -> BitArray {
-  encode_frame(Pong(payload:), final: True, compression: None, masking:)
+  encode_frame(
+    Control(Pong(payload:)),
+    final: True,
+    compression: None,
+    masking:,
+  )
 }
 
 /// Encodes a close frame with the given reason and mask.
@@ -899,7 +930,12 @@ pub fn encode_close_frame(
   reason reason: CloseReason,
   masking masking: Option(BitArray),
 ) -> BitArray {
-  encode_frame(Close(reason:), final: True, compression: None, masking:)
+  encode_frame(
+    Control(Close(reason:)),
+    final: True,
+    compression: None,
+    masking:,
+  )
 }
 
 // -----------------------------------------------------------------------------
@@ -1004,10 +1040,8 @@ fn do_resolve_fragments(
     // Complete frames are considered resolved if there is no fragmentation 
     // happening.
     [Complete(frame), ..rest], Empty(..) as context -> {
-      internal_frame_to_frame(frame, context.compression)
-      |> result.try(fn(frame) {
-        do_resolve_fragments([Resolved(frame), ..rest], context, resolved)
-      })
+      let frame = Resolved(internal_frame_to_frame(frame, context.compression))
+      do_resolve_fragments([frame, ..rest], context, resolved)
     }
 
     // Incomplete text frame begins fragmentation of text frame.
@@ -1071,8 +1105,154 @@ fn do_resolve_fragments(
         resolved,
       )
     }
+
     // Received complete frame when fragmentation is happening.
     [Complete(..), ..], Accumulating(..) -> Error(FragmentationInterrupted)
+  }
+}
+
+pub type ResolveNext(state) {
+  Continue(state: state)
+  Stop(state: state)
+}
+
+pub type ProcessError {
+  DecodeFailed(reason: DecodeError)
+  ResolveFailed(reason: ResolveError)
+}
+
+pub fn process_incomming_frames(
+  data: BitArray,
+  context: Context,
+  state: state,
+  handler: fn(state, Context, Frame) -> ResolveNext(state),
+) {
+  let data = <<context.buffer:bits, data:bits>>
+  do_process_incomming_frames(data, context, state, handler)
+}
+
+fn do_process_incomming_frames(
+  data: BitArray,
+  context: Context,
+  state: state,
+  handler: fn(state, Context, Frame) -> ResolveNext(state),
+) {
+  case decode_frame(data, context) {
+    Ok(#(decoded_frame, rest)) -> {
+      let result =
+        resolve_and_handle_single_frame(decoded_frame, context, state, handler)
+      case result {
+        Ok(#(Continue(new_state), new_context)) ->
+          case rest {
+            <<>> -> Ok(#(new_state, update_buffer(new_context, <<>>)))
+            _ ->
+              do_process_incomming_frames(rest, new_context, new_state, handler)
+          }
+        Ok(#(Stop(new_state), new_context)) ->
+          Ok(#(new_state, update_buffer(new_context, rest)))
+        Error(e) -> Error(ResolveFailed(e))
+      }
+    }
+    Error(NotEnoughData(remaining)) ->
+      Ok(#(state, update_buffer(context, remaining)))
+    Error(e) -> Error(DecodeFailed(e))
+  }
+}
+
+fn resolve_and_handle_single_frame(
+  decoded_frame: DecodedFrame,
+  context: Context,
+  state: state,
+  handler: fn(state, Context, Frame) -> ResolveNext(state),
+) {
+  case decoded_frame, context {
+    Resolved(Text(payload:)), context ->
+      case bit_array.is_utf8(payload) {
+        True -> Ok(#(handler(state, context, Text(payload:)), context))
+        False -> Error(NotUtf8)
+      }
+
+    Resolved(frame), context -> Ok(#(handler(state, context, frame), context))
+
+    Complete(DecodedContinuation(..)), Empty(..) -> Error(OrphanedContinuation)
+
+    Complete(frame), Empty(..) as context ->
+      internal_frame_to_frame(frame, context.compression)
+      |> Resolved
+      |> resolve_and_handle_single_frame(context, state, handler)
+
+    Incomplete(DecodedText(payload:, compressed:)), Empty(compression:, buffer:)
+    ->
+      Ok(#(
+        Continue(state),
+        Accumulating(Text, payload, compressed:, compression:, buffer:),
+      ))
+
+    Incomplete(DecodedBinary(payload:, compressed:)),
+      Empty(compression:, buffer:)
+    -> {
+      Ok(#(
+        Continue(state),
+        Accumulating(Binary, payload, compressed:, compression:, buffer:),
+      ))
+    }
+
+    Incomplete(DecodedContinuation(..)), Empty(..) ->
+      Error(OrphanedContinuation)
+
+    Incomplete(DecodedControl(..)), Empty(..) ->
+      panic as "Incomplete(DecodedControl(..)) is not allowed"
+
+    Incomplete(DecodedContinuation(payload:, compressed:)),
+      Accumulating(accumulated_payload:, ..) as context
+    -> {
+      case compressed {
+        // TODO: handle this in decode_frame function?
+        True -> Error(CompressedContinuation)
+        False ->
+          Ok(#(
+            Continue(state),
+            Accumulating(..context, accumulated_payload: <<
+              accumulated_payload:bits,
+              payload:bits,
+            >>),
+          ))
+      }
+    }
+
+    // Incomplete frames cannot be fragmented concurrently.
+    Incomplete(..), Accumulating(..) -> Error(ConcurrentFragmentation)
+
+    // Complete continuation completes fragmentation
+    Complete(DecodedContinuation(payload:, compressed:)),
+      Accumulating(..) as context
+    -> {
+      case compressed {
+        // TODO: handle this in decode_frame function?
+        True -> Error(CompressedContinuation)
+        False -> {
+          let complete_payload =
+            apply_decompression(
+              context.compression,
+              <<context.accumulated_payload:bits, payload:bits>>,
+              context.compressed,
+            )
+
+          let frame = context.frame_builder(complete_payload)
+          let new_context = Empty(context.compression, context.buffer)
+
+          resolve_and_handle_single_frame(
+            Resolved(frame),
+            new_context,
+            state,
+            handler,
+          )
+        }
+      }
+    }
+
+    // Received complete frame when fragmentation is happening.
+    Complete(..), Accumulating(..) -> Error(FragmentationInterrupted)
   }
 }
 
@@ -1114,9 +1294,7 @@ pub fn to_decoded_frame(
     Continuation(payload:) -> DecodedContinuation(payload:, compressed:)
     Text(payload:) -> DecodedText(payload:, compressed:)
     Binary(payload:) -> DecodedBinary(payload:, compressed:)
-    Ping(payload:) -> DecodedPing(payload:)
-    Pong(payload:) -> DecodedPong(payload:)
-    Close(reason:) -> DecodedClose(reason:)
+    Control(control:) -> DecodedControl(control:)
   }
 
   case final {
