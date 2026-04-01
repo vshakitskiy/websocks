@@ -379,7 +379,7 @@ fn init_compression(
   inflate_window_bits: Int,
 ) -> Compression {
   let inflate_context = open_compression_context()
-  init_inflate(inflate_context, deflate_window_bits)
+  init_inflate(inflate_context, inflate_window_bits)
 
   let deflate_context = open_compression_context()
   init_deflate(

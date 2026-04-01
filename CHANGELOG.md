@@ -1,5 +1,9 @@
 # Changelog
 
+## 3.0.1 - 01.04.26
+
+- Use inflate window bits instead of deflate for inflate context.
+
 ## 3.0.0 - 01.04.26
 
 - `create_context` now requires `Role` parameter
