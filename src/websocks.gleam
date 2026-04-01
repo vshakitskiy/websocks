@@ -2,10 +2,11 @@
 //// const docs = [
 ////   {
 ////     header: "Handshake",
-////     functions: ["magic_string",
+////     functions: [
+////       "magic_string",
 ////       "compute_accept",
 ////       "has_deflate",
-////       "get_context_takeovers"
+////       "get_compression_extensions"
 ////     ]
 ////   },
 ////   {
@@ -39,12 +40,12 @@
 ////     functions: ["process_incoming_frames"]
 ////   }
 //// ]
-//// 
+////
 //// const callback = () => {
 ////   const list = document.querySelector(".sidebar > ul:last-of-type")
 ////   const sortedLists = document.createDocumentFragment()
 ////   const sortedMembers = document.createDocumentFragment()
-//// 
+////
 ////   for (const section of docs) {
 ////     sortedLists.append((() => {
 ////       const node = document.createElement("h3")
@@ -56,12 +57,12 @@
 ////       node.append(section.header)
 ////       return node
 ////     })())
-//// 
+////
 ////     const sortedList = document.createElement("ul")
 ////     sortedLists.append(sortedList)
-//// 
+////
 ////     const sortedFunctions = [...section.functions].sort()
-//// 
+////
 ////     for (const funcName of sortedFunctions) {
 ////       const href = `#${funcName}`
 ////       const member = document.querySelector(
@@ -72,7 +73,7 @@
 ////       sortedMembers.append(member)
 ////     }
 ////   }
-//// 
+////
 ////   document.querySelector(".sidebar").insertBefore(sortedLists, list)
 ////   document
 ////     .querySelector(".module-members:has(#module-values)")
@@ -81,7 +82,7 @@
 ////       document.querySelector("#module-values").nextSibling
 ////     )
 //// }
-//// 
+////
 //// document.readyState !== "loading"
 ////   ? callback()
 ////   : document.addEventListener(
@@ -101,6 +102,7 @@ import gleam/bool
 import gleam/bytes_tree
 import gleam/crypto
 import gleam/erlang/atom
+import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
@@ -112,19 +114,34 @@ import gleam/string
 
 /// Sequence of characters that is used to compute the `Sec-WebSocket-Accept`
 /// header during the handshake.
-/// 
+///
 pub const magic_string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+/// Generates a random WebSocket key for the `Sec-WebSocket-Key` header.
+/// Used by clients during the handshake.
+///
+/// ### Example
+///
+/// ```gleam
+/// websocks.websocket_key()
+/// // => "dGhlIHNhbXBsZSBub25jZQ=="
+/// ```
+///
+pub fn websocket_key() -> String {
+  crypto.strong_random_bytes(16)
+  |> bit_array.base64_encode(True)
+}
 
 /// Computes the value of the `Sec-WebSocket-Accept` header during the handshake.
 /// Requires `Sec-WebSocket-Key` header value to be present.
 ///
 /// ### Example
-/// 
+///
 /// ```gleam
 /// websocks.compute_accept("dGhlIHNhbXBsZSBub25jZQ==")
 /// // => "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
 /// ```
-/// 
+///
 pub fn compute_accept(key: String) -> String {
   string.append(key, magic_string)
   |> bit_array.from_string()
@@ -136,60 +153,102 @@ pub fn compute_accept(key: String) -> String {
 /// extensions.
 ///
 /// ### Example
-/// 
+///
 /// ```gleam
 /// let extensions =
 ///    request.get_header(req, "sec-websocket-extensions")
 ///    |> result.map(string.split(_, ";"))
 ///    |> result.unwrap([])
 /// // => ["permessage-deflate", "client_no_context_takeover"]
-/// 
+///
 /// websocks.has_deflate(extensions)
 /// // => True
 /// ```
-/// 
+///
 pub fn has_deflate(extensions: List(String)) -> Bool {
   list.any(extensions, fn(str) { str == "permessage-deflate" })
 }
 
-/// Context takeover settings. Disabling context takeover means the compression 
-/// context is reset after each message, reducing memory overhead but making 
-/// compression less effective for small, repetitive payloads.
+/// Specifies whether the endpoint is a client or server. This determines how
+/// compression parameters are interpreted.
 ///
-pub type ContextTakeover {
-  ContextTakeover(
-    /// Indicates that the client does not want to use context takeover.
-    no_client: Bool,
-    /// Indicates that the server does not want to use context takeover.
-    no_server: Bool,
+pub type Role {
+  /// Endpoint initiates connections
+  ///
+  Client
+  /// Endpoint accepts connections
+  ///
+  Server
+}
+
+/// Negotiated compression extension parameters from the WebSocket handshake.
+/// These parameters control per-message-deflate compression behavior. Obtained
+/// by calling `get_compression_extensions` on the `Sec-WebSocket-Extensions`
+/// header value.
+///
+pub type CompressionExtensions {
+  CompressionExtensions(
+    /// Client does not use context takeover
+    ///
+    client_no_context_takeover: Bool,
+    /// Client's maximum LZ77 window size for compression
+    ///
+    client_max_window_bits: Option(Int),
+    /// Server does not use context takeover
+    ///
+    server_no_context_takeover: Bool,
+    /// Server's maximum LZ77 window size for compression
+    ///
+    server_max_window_bits: Option(Int),
   )
 }
 
-/// Extracts the client and server context takeover settings from the list of
-/// extensions.
+const default_extensions = CompressionExtensions(
+  client_no_context_takeover: False,
+  client_max_window_bits: None,
+  server_no_context_takeover: False,
+  server_max_window_bits: None,
+)
+
+/// Parses compression extension parameters from the handshake extension list.
+/// Extracts context takeover settings as well as window bits.
 ///
 /// ### Example
-/// 
+///
 /// ```gleam
-/// let extensions =
-///    request.get_header(req, "sec-websocket-extensions")
-///    |> result.map(string.split(_, ";"))
-///    |> result.unwrap([])
-/// // => ["permessage-deflate", "client_no_context_takeover"]
-/// 
-/// websocks.get_context_takeovers(extensions)
-/// // => ContextTakeover(no_client: True, no_server: False)
+/// let extensions = [
+///   "permessage-deflate",
+///   "client_no_context_takeover",
+///   "client_max_window_bits=15",
+/// ]
+///
+/// websocks.get_compression_extensions(extensions)
+/// // => CompressionExtensions(
+/// //      client_no_context_takeover: True,
+/// //      client_max_window_bits: Some(15),
+/// //      server_no_context_takeover: False,
+/// //      server_max_window_bits: None,
+/// //    )
 /// ```
-/// 
-pub fn get_context_takeovers(extensions: List(String)) -> ContextTakeover {
-  let no_client_context_takeover =
-    list.any(extensions, fn(str) { str == "client_no_context_takeover" })
-  let no_server_context_takeover =
-    list.any(extensions, fn(str) { str == "server_no_context_takeover" })
-  ContextTakeover(
-    no_client: no_client_context_takeover,
-    no_server: no_server_context_takeover,
-  )
+///
+pub fn get_compression_extensions(extensions: List(String)) {
+  list.fold(extensions, default_extensions, fn(acc, extension) {
+    case extension {
+      "client_no_context_takeover" ->
+        CompressionExtensions(..acc, client_no_context_takeover: True)
+      "client_max_window_bits=" <> bits -> {
+        let client_max_window_bits = option.from_result(int.parse(bits))
+        CompressionExtensions(..acc, client_max_window_bits:)
+      }
+      "server_no_context_takeover" ->
+        CompressionExtensions(..acc, server_no_context_takeover: True)
+      "server_max_window_bits=" <> bits -> {
+        let server_max_window_bits = option.from_result(int.parse(bits))
+        CompressionExtensions(..acc, server_max_window_bits:)
+      }
+      _ -> acc
+    }
+  })
 }
 
 // -----------------------------------------------------------------------------
@@ -199,7 +258,7 @@ pub fn get_context_takeovers(extensions: List(String)) -> ContextTakeover {
 /// Masks the payload of any length using the provided mask.
 ///
 /// ### Example
-/// 
+///
 /// ```gleam
 /// let payload = bit_array.from_string("Hello")
 /// // Original: H(0x48) e(0x65) l(0x6c) l(0x6c) o(0x6f)
@@ -208,7 +267,7 @@ pub fn get_context_takeovers(extensions: List(String)) -> ContextTakeover {
 /// websocks.mask(payload, <<0x37, 0xfa, 0x21, 0x3d>>)
 /// // => <<0x7f, 0x9f, 0x4d, 0x51, 0x58>>
 /// ```
-/// 
+///
 pub fn mask(payload: BitArray, mask: BitArray) -> BitArray {
   let payload_length = bit_array.byte_size(payload)
   repeat_mask(mask, payload_length)
@@ -255,9 +314,11 @@ type Compression {
   Disabled
   Enabled(
     inflate_context: CompressionContext,
+    inflate_window_bits: Int,
     deflate_context: CompressionContext,
-    no_client: Bool,
-    no_server: Bool,
+    deflate_window_bits: Int,
+    reset_on_compress: Bool,
+    reset_on_decompress: Bool,
   )
 }
 
@@ -311,9 +372,12 @@ fn deflate_reset(context: CompressionContext) -> atom.Atom
 @external(erlang, "zlib", "close")
 fn close_compression_context(context: CompressionContext) -> atom.Atom
 
-const deflate_window_bits = -15
-
-fn init_compression(no_client: Bool, no_server: Bool) -> Compression {
+fn init_compression(
+  reset_on_compress: Bool,
+  reset_on_decompress: Bool,
+  deflate_window_bits: Int,
+  inflate_window_bits: Int,
+) -> Compression {
   let inflate_context = open_compression_context()
   init_inflate(inflate_context, deflate_window_bits)
 
@@ -327,25 +391,31 @@ fn init_compression(no_client: Bool, no_server: Bool) -> Compression {
     Default,
   )
 
-  Enabled(inflate_context:, deflate_context:, no_client:, no_server:)
+  Enabled(
+    inflate_context:,
+    inflate_window_bits:,
+    deflate_context:,
+    deflate_window_bits:,
+    reset_on_compress:,
+    reset_on_decompress:,
+  )
 }
 
 fn compress(state: Compression, payload: BitArray) -> BitArray {
   case state {
     Disabled -> payload
-    Enabled(_, deflate_context, _, no_server) -> {
+    Enabled(deflate_context:, reset_on_compress:, ..) -> {
       let compressed =
         do_deflate(deflate_context, <<payload:bits>>, Sync)
         |> bytes_tree.to_bit_array()
 
       let size = bit_array.byte_size(compressed) - 4
-
       let compressed = case compressed {
         <<compressed:bytes-size(size), 0x00, 0x00, 0xff, 0xff>> -> compressed
         _ -> compressed
       }
 
-      case no_server {
+      case reset_on_compress {
         True -> {
           deflate_reset(deflate_context)
           Nil
@@ -361,12 +431,12 @@ fn compress(state: Compression, payload: BitArray) -> BitArray {
 fn decompress(state: Compression, payload: BitArray) -> BitArray {
   case state {
     Disabled -> payload
-    Enabled(inflate_context, _, no_client, _) -> {
+    Enabled(inflate_context:, reset_on_decompress:, ..) -> {
       let decompressed =
         do_inflate(inflate_context, <<payload:bits, 0x00, 0x00, 0xff, 0xff>>)
         |> bytes_tree.to_bit_array()
 
-      case no_client {
+      case reset_on_decompress {
         True -> {
           inflate_reset(inflate_context)
           Nil
@@ -394,9 +464,9 @@ fn close_compression(state: Compression) -> Nil {
 // Context
 // -----------------------------------------------------------------------------
 
-/// Context is the internal state of the WebSocket connection. It stores the 
-/// remaining bytes from the decoding process, fragment accumulation and 
-/// compression states. 
+/// Context is the internal state of the WebSocket connection. It stores the
+/// remaining bytes from the decoding process, fragment accumulation and
+/// compression states.
 pub opaque type Context {
   Empty(compression: Compression, buffer: BitArray)
   Accumulating(
@@ -408,35 +478,70 @@ pub opaque type Context {
   )
 }
 
-/// Creates a new context with the optional compression settings.
+/// Creates a new context with optional compression settings and role
+/// specification. The role parameter determines how compression parameters are
+/// interpreted.
 ///
 /// ### Example
-/// 
+///
 /// ```gleam
-/// websocks.create_context(
-///   Some(websocks.ContextTakeover(no_client: True, no_server: False)),
-/// )
+/// let extensions = websocks.get_compression_extensions([
+///   "permessage-deflate",
+///   "client_no_context_takeover",
+/// ])
+///
+/// websocks.create_context(Some(extensions), websocks.Client)
 /// // => Context
 /// ```
-/// 
-pub fn create_context(compression: Option(ContextTakeover)) -> Context {
-  case compression {
-    Some(ContextTakeover(no_client, no_server)) ->
-      Empty(compression: init_compression(no_client, no_server), buffer: <<>>)
+///
+pub fn create_context(
+  extensions: Option(CompressionExtensions),
+  role: Role,
+) -> Context {
+  case extensions {
+    Some(CompressionExtensions(
+      client_no_context_takeover:,
+      client_max_window_bits:,
+      server_no_context_takeover:,
+      server_max_window_bits:,
+    )) -> {
+      let #(reset_on_compress, reset_on_decompress) = case role {
+        Client -> #(client_no_context_takeover, server_no_context_takeover)
+        Server -> #(server_no_context_takeover, client_no_context_takeover)
+      }
+
+      let client_max_window_bits =
+        option.map(client_max_window_bits, int.negate) |> option.unwrap(-15)
+      let server_max_window_bits =
+        option.map(server_max_window_bits, int.negate) |> option.unwrap(-15)
+
+      let #(deflate_window_bits, inflate_window_bits) = case role {
+        Client -> #(client_max_window_bits, server_max_window_bits)
+        Server -> #(server_max_window_bits, client_max_window_bits)
+      }
+
+      init_compression(
+        reset_on_compress,
+        reset_on_decompress,
+        deflate_window_bits,
+        inflate_window_bits,
+      )
+      |> Empty(buffer: <<>>)
+    }
     None -> Empty(compression: Disabled, buffer: <<>>)
   }
 }
 
-/// Frees the compression resources. Should be called when the context is no 
+/// Frees the compression resources. Should be called when the context is no
 /// longer needed.
 ///
 /// ### Example
-/// 
+///
 /// ```gleam
 /// websocks.close_context(context)
 /// // => Nil
 /// ```
-/// 
+///
 pub fn close_context(context: Context) -> Nil {
   close_compression(context.compression)
 }
@@ -473,7 +578,7 @@ fn apply_decompression(
 // Frames
 // -----------------------------------------------------------------------------
 
-/// Each variant corresponds to a type of WebSocket frame, carrying the 
+/// Each variant corresponds to a type of WebSocket frame, carrying the
 /// appropriate payload.
 pub type Frame {
   /// A continuation frame, used for fragmented messages.
@@ -500,7 +605,7 @@ pub type Control {
 pub type CloseReason {
   /// The connection successfully completed its purpose and is closing normally.
   NormalClosure(data: BitArray)
-  /// The endpoint is going away, either due to server shutdown or browser 
+  /// The endpoint is going away, either due to server shutdown or browser
   /// navigation.
   GoingAway(data: BitArray)
   /// A WebSocket protocol violation was detected.
@@ -513,7 +618,7 @@ pub type CloseReason {
   PolicyViolation(data: BitArray)
   /// Message exceeds the maximum size the endpoint can handle.
   MessageTooBig(data: BitArray)
-  /// The server encountered an unexpected condition preventing request 
+  /// The server encountered an unexpected condition preventing request
   /// fulfillment.
   MandatoryExtension(data: BitArray)
   /// The server encountered unexpected error.
@@ -565,7 +670,7 @@ fn internal_frame_to_frame(
 // Decoding
 // -----------------------------------------------------------------------------
 
-/// The result of the decoding process. It contains the decoded 
+/// The result of the decoding process. It contains the decoded
 /// complete/incomplete frame with possible compression applied.
 pub opaque type DecodedFrame {
   Complete(InternalFrame)
@@ -581,11 +686,11 @@ pub type DecodeError {
   NotEnoughData(data: BitArray)
 }
 
-/// Decodes a single frame from the given data. For decoding multiple frames 
+/// Decodes a single frame from the given data. For decoding multiple frames
 /// it is recommended to use `decode_many_frames` instead.
-/// 
+///
 /// ### Example
-/// 
+///
 /// ```gleam
 /// // 0x81 : fin=1, rsv1-3=0, opcode=1
 /// // 0x05 : mask=0, payload length=5
@@ -610,7 +715,7 @@ pub type DecodeError {
 /// websocks.decode_frame(<<rest:bits, payload:bits>>)
 /// // => Ok(#(DecodedFrame, <<>>))
 /// ```
-///  
+///
 pub fn decode_frame(
   data: BitArray,
   context: Context,
@@ -728,11 +833,11 @@ pub fn decode_frame(
   }
 }
 
-/// Decodes multiple frames from the given data until the buffer is empty or an 
+/// Decodes multiple frames from the given data until the buffer is empty or an
 /// error occurs. Returns the provided context with updated buffer.
-/// 
+///
 /// ### Example
-/// 
+///
 /// ```gleam
 /// // 0x81 : fin=1, rsv1-3=0, opcode=1
 /// // 0x04 : mask=0, payload length=4
@@ -765,7 +870,7 @@ pub fn decode_frame(
 /// websocks.decode_many_frames(payload3, updated_context)
 /// // => Ok(#([DecodedFrame], Context: <<>>))
 /// ```
-/// 
+///
 pub fn decode_many_frames(
   data: BitArray,
   context: Context,
@@ -962,14 +1067,14 @@ pub type ResolveError {
   CompressedContinuation
 }
 
-/// Resolves a list of decoded frames into a list of frames. If the context has 
+/// Resolves a list of decoded frames into a list of frames. If the context has
 /// compression enabled, the payload will be decompressed. Incomplete frames are
-/// stored in the updated context until the fragmentation is complete. If 
-/// returns an error, the protocol is violated, and the implementation should 
+/// stored in the updated context until the fragmentation is complete. If
+/// returns an error, the protocol is violated, and the implementation should
 /// consider closing the WebSocket connection.
-/// 
+///
 /// ### Example
-/// 
+///
 /// ```gleam
 /// // Incomplete text frame:
 /// // 0x01 : fin=0, rsv1-3=0, opcode=1
@@ -1000,16 +1105,16 @@ pub type ResolveError {
 /// >>
 ///
 /// let context = websocks.create_context(None)
-/// 
+///
 /// // We assume that the frames have been successfully decoded.
 /// let assert Ok(#(decoded_frames, context)) =
 ///   websocks.decode_many_frames(frames, context)
-/// 
+///
 /// // Resolve the decoded frames.
 /// websocks.resolve_fragments(decoded_frames, context)
 /// // => Ok(#([Text("Hello World!")], Context))
 /// ```
-/// 
+///
 pub fn resolve_fragments(
   decoded_frames: List(DecodedFrame),
   context: Context,
@@ -1034,14 +1139,14 @@ fn do_resolve_fragments(
         False -> Error(NotUtf8)
       }
     }
-    // The rest resolved frame types can be freely added to the resolved list. 
+    // The rest resolved frame types can be freely added to the resolved list.
     [Resolved(frame), ..rest], context ->
       do_resolve_fragments(rest, context, [frame, ..resolved])
 
     // Continuation frames cannot be the first frame in a fragmentation.
     [Complete(DecodedContinuation(..)), ..], Empty(..) ->
       Error(OrphanedContinuation)
-    // Complete frames are considered resolved if there is no fragmentation 
+    // Complete frames are considered resolved if there is no fragmentation
     // happening.
     [Complete(frame), ..rest], Empty(..) as context -> {
       let frame = Resolved(internal_frame_to_frame(frame, context.compression))
@@ -1126,7 +1231,7 @@ pub type ResolveNext(state) {
   Stop(state: state)
 }
 
-/// Errors that can occur during the frame processing in 
+/// Errors that can occur during the frame processing in
 /// `process_incoming_frames`.
 pub type ProcessError {
   /// Frame decoding failed with the given decode error.
@@ -1135,15 +1240,15 @@ pub type ProcessError {
   ResolveFailed(reason: ResolveError)
 }
 
-/// Processes incoming WebSocket frames from the given data. This function 
-/// combines the context buffer with the new data, decodes frames, resolves 
-/// fragments, and calls the handler function for each resolved frame. The 
-/// handler returns `ResolveNext` to control the processing flow. If there's not 
-/// enough data to decode a complete frame, the remaining data is stored in the 
+/// Processes incoming WebSocket frames from the given data. This function
+/// combines the context buffer with the new data, decodes frames, resolves
+/// fragments, and calls the handler function for each resolved frame. The
+/// handler returns `ResolveNext` to control the processing flow. If there's not
+/// enough data to decode a complete frame, the remaining data is stored in the
 /// context buffer for the next call.
 ///
 /// ### Example
-/// 
+///
 /// ```gleam
 /// // 0x81 : fin=1, rsv1-3=0, opcode=1
 /// // 0x05 : mask=0, payload length=5
@@ -1185,7 +1290,7 @@ pub type ProcessError {
 /// echo processed
 /// // => Ok(#(1, context: <<0x81, 0x05>>))
 /// ```
-/// 
+///
 pub fn process_incoming_frames(
   data: BitArray,
   context: Context,
@@ -1324,7 +1429,7 @@ fn resolve_and_handle_single_frame(
 // -----------------------------------------------------------------------------
 // Testing
 // -----------------------------------------------------------------------------
-// NOTE: These functions are for internal use only, and are used in test 
+// NOTE: These functions are for internal use only, and are used in test
 // suites. Do NOT use them in your own code.
 
 @internal
@@ -1378,5 +1483,5 @@ fn wrap_decoded_frame(internal: InternalFrame, final: Bool) -> DecodedFrame {
 
 @internal
 pub fn compress_payload(payload: BitArray) -> BitArray {
-  compress(init_compression(False, False), payload)
+  compress(init_compression(False, False, -15, -15), payload)
 }
