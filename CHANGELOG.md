@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 3.0.0 - 01.04.26
 
 - `create_context` now requires `Role` parameter
 - Replace `ContextTakeover` with `CompressionExtensions` type
