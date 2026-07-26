@@ -1,32 +1,23 @@
+//// Builds raw WebSocket frames for the test suite.
+
 import gleam/bit_array
+import gleam/int
+import gleam/list
 import gleam/option.{type Option, None, Some}
-import websocks
 
-// Only the fin bit as well as the reserved bits are present.
-pub const unfinished_frame = <<1:1, 0:3>>
-
-pub const invalid_opcode_frame = <<
-  // fin
-  1:1,
-  // rsvs
-  0:3,
-  // opcode
-  15:4,
-  // mask bit
-  0:1,
-  // payload length
-  0:7,
-  // rest
-  <<>>:bits,
->>
+/// The mask key from RFC 6455 section 5.7, used by most tests.
+///
+pub const mask_key = <<0x37, 0xfa, 0x21, 0x3d>>
 
 pub type Opcode {
   Continuation
   Text
   Binary
+  Close
   Ping
   Pong
-  Close
+  /// An opcode the protocol does not define, for rejection tests.
+  Reserved(code: Int)
 }
 
 fn opcode_to_int(opcode: Opcode) -> Int {
@@ -34,72 +25,200 @@ fn opcode_to_int(opcode: Opcode) -> Int {
     Continuation -> 0
     Text -> 1
     Binary -> 2
+    Close -> 8
     Ping -> 9
     Pong -> 10
-    Close -> 8
+    Reserved(code:) -> code
   }
 }
 
-pub fn construct(
-  fin fin: Bool,
-  rsv1 rsv1: Bool,
-  rsv2 rsv2: Bool,
-  rsv3 rsv3: Bool,
-  opcode opcode: Opcode,
-  mask mask: Option(BitArray),
-  payload payload: BitArray,
-) -> BitArray {
-  let fin = case fin {
-    True -> 1
-    False -> 0
-  }
+pub opaque type Builder {
+  Builder(
+    fin: Bool,
+    rsv1: Bool,
+    rsv2: Bool,
+    rsv3: Bool,
+    opcode: Opcode,
+    mask: Option(BitArray),
+    payload: BitArray,
+  )
+}
 
-  let rsv1 = case rsv1 {
-    True -> 1
-    False -> 0
-  }
+/// A final, unmasked, uncompressed frame with an empty payload.
+///
+pub fn new(opcode: Opcode) -> Builder {
+  Builder(
+    fin: True,
+    rsv1: False,
+    rsv2: False,
+    rsv3: False,
+    opcode:,
+    mask: None,
+    payload: <<>>,
+  )
+}
 
-  let rsv2 = case rsv2 {
-    True -> 1
-    False -> 0
-  }
+pub fn payload(builder: Builder, payload: BitArray) -> Builder {
+  Builder(..builder, payload:)
+}
 
-  let rsv3 = case rsv3 {
-    True -> 1
-    False -> 0
-  }
+pub fn text(builder: Builder, text: String) -> Builder {
+  Builder(..builder, payload: <<text:utf8>>)
+}
 
-  let opcode = opcode_to_int(opcode)
+pub fn fin(builder: Builder, fin: Bool) -> Builder {
+  Builder(..builder, fin:)
+}
 
-  let payload_length = bit_array.byte_size(payload)
+pub fn rsv1(builder: Builder, rsv1: Bool) -> Builder {
+  Builder(..builder, rsv1:)
+}
 
-  let #(mask_bit, mask, payload) = case mask {
-    Some(mask) -> #(1, mask, websocks.mask(payload, mask))
+pub fn rsv2(builder: Builder, rsv2: Bool) -> Builder {
+  Builder(..builder, rsv2:)
+}
+
+pub fn rsv3(builder: Builder, rsv3: Bool) -> Builder {
+  Builder(..builder, rsv3:)
+}
+
+/// Masks with `mask_key`, as a client must.
+///
+pub fn masked(builder: Builder) -> Builder {
+  Builder(..builder, mask: Some(mask_key))
+}
+
+pub fn masked_with(builder: Builder, key: BitArray) -> Builder {
+  Builder(..builder, mask: Some(key))
+}
+
+pub fn build(builder: Builder) -> BitArray {
+  let Builder(fin:, rsv1:, rsv2:, rsv3:, opcode:, mask:, payload:) = builder
+
+  let #(mask_bit, mask_bytes, body) = case mask {
+    Some(key) -> #(1, key, apply_mask(payload, key))
     None -> #(0, <<>>, payload)
   }
 
-  let encoded_payload_length = case payload_length {
-    _ if payload_length <= 125 -> payload_length
-    _ if payload_length <= 65_535 -> 126
-    _ -> 127
+  <<
+    to_bit(fin):1,
+    to_bit(rsv1):1,
+    to_bit(rsv2):1,
+    to_bit(rsv3):1,
+    opcode_to_int(opcode):4,
+    mask_bit:1,
+    encoded_length(payload):bits,
+    mask_bytes:bits,
+    body:bits,
+  >>
+}
+
+/// Builds a frame whose length is declared in `bits` bits regardless of how
+/// small the payload is, so the decoder's minimal-encoding rule can be tested.
+///
+pub fn with_forced_length_bits(builder: Builder, bits: Int) -> BitArray {
+  let Builder(fin:, rsv1:, rsv2:, rsv3:, opcode:, mask:, payload:) = builder
+  let length = byte_size(payload)
+
+  let #(mask_bit, mask_bytes, body) = case mask {
+    Some(key) -> #(1, key, apply_mask(payload, key))
+    None -> #(0, <<>>, payload)
   }
 
-  let extended_payload = case encoded_payload_length {
-    126 -> <<payload_length:size(16)>>
-    127 -> <<payload_length:size(64)>>
-    _ -> <<>>
+  let #(length_code, extended) = case bits {
+    16 -> #(126, <<length:size(16)>>)
+    _bits -> #(127, <<length:size(64)>>)
   }
 
   <<
-    fin:1,
-    rsv1:1,
-    rsv2:1,
-    rsv3:1,
-    opcode:4,
+    to_bit(fin):1,
+    to_bit(rsv1):1,
+    to_bit(rsv2):1,
+    to_bit(rsv3):1,
+    opcode_to_int(opcode):4,
     mask_bit:1,
-    encoded_payload_length:7,
-    extended_payload:bits,
-    mask:bits,
-    payload:bits,
+    length_code:7,
+    extended:bits,
+    mask_bytes:bits,
+    body:bits,
   >>
+}
+
+fn encoded_length(payload: BitArray) -> BitArray {
+  let length = byte_size(payload)
+  case length {
+    _ if length <= 125 -> <<length:7>>
+    _ if length <= 65_535 -> <<126:7, length:size(16)>>
+    _ -> <<127:7, length:size(64)>>
+  }
+}
+
+fn to_bit(flag: Bool) -> Int {
+  case flag {
+    True -> 1
+    False -> 0
+  }
+}
+
+fn byte_size(bits: BitArray) -> Int {
+  do_byte_size(bits, 0)
+}
+
+fn do_byte_size(bits: BitArray, count: Int) -> Int {
+  case bits {
+    <<_byte:8, rest:bits>> -> do_byte_size(rest, count + 1)
+    _remainder -> count
+  }
+}
+
+fn apply_mask(payload: BitArray, key: BitArray) -> BitArray {
+  case to_bytes(key, []) {
+    [] -> payload
+    keys -> do_apply_mask(payload, keys, keys, <<>>)
+  }
+}
+
+fn do_apply_mask(
+  payload: BitArray,
+  all_keys: List(Int),
+  keys: List(Int),
+  acc: BitArray,
+) -> BitArray {
+  case payload, keys {
+    <<>>, _keys -> acc
+    _payload, [] -> do_apply_mask(payload, all_keys, all_keys, acc)
+    <<byte:8, rest:bits>>, [key, ..remaining_keys] -> {
+      let masked = int.bitwise_exclusive_or(byte, key)
+      do_apply_mask(rest, all_keys, remaining_keys, <<acc:bits, masked:8>>)
+    }
+    _payload, _keys -> acc
+  }
+}
+
+fn to_bytes(bits: BitArray, acc: List(Int)) -> List(Int) {
+  case bits {
+    <<byte:8, rest:bits>> -> to_bytes(rest, [byte, ..acc])
+    _remainder -> list.reverse(acc)
+  }
+}
+
+/// `size` bytes of filler payload.
+///
+pub fn filler(size: Int) -> BitArray {
+  list.repeat(<<"a":utf8>>, size)
+  |> bit_array.concat
+}
+
+/// Roughly `size` bytes of multi-byte UTF-8 filler, for validation tests.
+///
+pub fn utf8_filler(size: Int) -> BitArray {
+  let unit = <<"añ日🐑x":utf8>>
+  list.repeat(unit, size / bit_array.byte_size(unit) + 1)
+  |> bit_array.concat
+}
+
+/// Joins built frames into a single read.
+///
+pub fn join(frames: List(BitArray)) -> BitArray {
+  bit_array.concat(frames)
 }

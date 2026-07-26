@@ -15,11 +15,11 @@
 ////   },
 ////   {
 ////     header: "Context",
-////     functions: ["create_context", "close_context"]
+////     functions: ["create_context", "with_limits", "close_context"]
 ////   },
 ////   {
 ////     header: "Decoding",
-////     functions: ["decode_frame", "decode_many_frames"]
+////     functions: ["push_data", "next_frame"]
 ////   },
 ////   {
 ////     header: "Encoding",
@@ -30,14 +30,6 @@
 ////       "encode_pong_frame",
 ////       "encode_close_frame"
 ////     ]
-////   },
-////   {
-////     header: "Resolving fragments",
-////     functions: ["resolve_fragments"]
-////   },
-////   {
-////     header: "Processing",
-////     functions: ["process_incoming_frames"]
 ////   }
 //// ]
 ////
@@ -92,11 +84,6 @@
 ////   )
 //// </script>
 
-// TODO:
-// pub fn begin_fragmentation(...)
-// pub fn continue_fragmentation(...)
-// pub fn finish_fragmentation(...)
-
 import gleam/bit_array
 import gleam/bool
 import gleam/bytes_tree
@@ -108,6 +95,12 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 
+@external(erlang, "websocks_ffi", "is_utf8")
+fn is_utf8(payload: BitArray) -> Bool
+
+@external(erlang, "websocks_ffi", "to_string")
+fn to_string(payload: BitArray) -> Result(String, Nil)
+
 // -----------------------------------------------------------------------------
 // Handshake
 // -----------------------------------------------------------------------------
@@ -115,7 +108,7 @@ import gleam/string
 /// Sequence of characters that is used to compute the `Sec-WebSocket-Accept`
 /// header during the handshake.
 ///
-pub const magic_string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+pub const magic_string: String = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 /// Generates a random WebSocket key for the `Sec-WebSocket-Key` header.
 /// Used by clients during the handshake.
@@ -149,24 +142,41 @@ pub fn compute_accept(key: String) -> String {
   |> bit_array.base64_encode(True)
 }
 
-/// Checks if the `permessage-deflate` extension is present in the list of
-/// extensions.
+/// Splits a `Sec-WebSocket-Extensions` header value into its tokens. Offers are
+/// separated by commas and parameters by semicolons, and either may be padded
+/// with whitespace, which is why splitting the header belongs here rather than in
+/// the caller.
+///
+fn extension_tokens(header: String) -> List(String) {
+  header
+  |> string.replace(",", ";")
+  |> string.split(";")
+  |> list.filter_map(fn(token) {
+    case string.trim(token) {
+      "" -> Error(Nil)
+      token -> Ok(string.lowercase(token))
+    }
+  })
+}
+
+/// Checks whether a `Sec-WebSocket-Extensions` header value offers
+/// `permessage-deflate`.
 ///
 /// ### Example
 ///
 /// ```gleam
-/// let extensions =
-///    request.get_header(req, "sec-websocket-extensions")
-///    |> result.map(string.split(_, ";"))
-///    |> result.unwrap([])
-/// // => ["permessage-deflate", "client_no_context_takeover"]
+/// let header =
+///   request.get_header(req, "sec-websocket-extensions")
+///   |> result.unwrap("")
+/// // => "permessage-deflate; client_no_context_takeover"
 ///
-/// websocks.has_deflate(extensions)
+/// websocks.has_deflate(header)
 /// // => True
 /// ```
 ///
-pub fn has_deflate(extensions: List(String)) -> Bool {
-  list.any(extensions, fn(str) { str == "permessage-deflate" })
+pub fn has_deflate(header: String) -> Bool {
+  extension_tokens(header)
+  |> list.contains("permessage-deflate")
 }
 
 /// Specifies whether the endpoint is a client or server. This determines how
@@ -203,26 +213,26 @@ pub type CompressionExtensions {
   )
 }
 
-const default_extensions = CompressionExtensions(
+const default_extensions: CompressionExtensions = CompressionExtensions(
   client_no_context_takeover: False,
   client_max_window_bits: None,
   server_no_context_takeover: False,
   server_max_window_bits: None,
 )
 
-/// Parses compression extension parameters from the handshake extension list.
-/// Extracts context takeover settings as well as window bits.
+/// Parses compression extension parameters out of a `Sec-WebSocket-Extensions`
+/// header value. Extracts context takeover settings as well as window bits.
+///
+/// Note that a header offering several alternatives is read as one set of
+/// parameters rather than as competing offers to choose between.
 ///
 /// ### Example
 ///
 /// ```gleam
-/// let extensions = [
-///   "permessage-deflate",
-///   "client_no_context_takeover",
-///   "client_max_window_bits=15",
-/// ]
+/// let header =
+///   "permessage-deflate; client_no_context_takeover; client_max_window_bits=15"
 ///
-/// websocks.get_compression_extensions(extensions)
+/// websocks.get_compression_extensions(header)
 /// // => CompressionExtensions(
 /// //      client_no_context_takeover: True,
 /// //      client_max_window_bits: Some(15),
@@ -231,9 +241,9 @@ const default_extensions = CompressionExtensions(
 /// //    )
 /// ```
 ///
-pub fn get_compression_extensions(extensions: List(String)) {
-  list.fold(extensions, default_extensions, fn(acc, extension) {
-    case extension {
+pub fn get_compression_extensions(header: String) -> CompressionExtensions {
+  list.fold(extension_tokens(header), default_extensions, fn(acc, token) {
+    case token {
       "client_no_context_takeover" ->
         CompressionExtensions(..acc, client_no_context_takeover: True)
       "client_max_window_bits=" <> bits -> {
@@ -246,7 +256,7 @@ pub fn get_compression_extensions(extensions: List(String)) {
         let server_max_window_bits = option.from_result(int.parse(bits))
         CompressionExtensions(..acc, server_max_window_bits:)
       }
-      _ -> acc
+      _token -> acc
     }
   })
 }
@@ -255,7 +265,8 @@ pub fn get_compression_extensions(extensions: List(String)) {
 // Masking
 // -----------------------------------------------------------------------------
 
-/// Masks the payload of any length using the provided mask.
+/// Masks the payload of any length using the provided mask. Masking is its own
+/// inverse, so this unmasks too. A mask key of no bytes leaves the payload alone.
 ///
 /// ### Example
 ///
@@ -269,40 +280,27 @@ pub fn get_compression_extensions(extensions: List(String)) {
 /// ```
 ///
 pub fn mask(payload: BitArray, mask: BitArray) -> BitArray {
-  let payload_length = bit_array.byte_size(payload)
-  repeat_mask(mask, payload_length)
-  |> exor(payload, _)
+  case bit_array.byte_size(mask) {
+    // `exor` needs operands of equal length, and an empty key can never be
+    // expanded to reach one.
+    0 -> payload
+    _mask_length ->
+      repeat_mask(mask, bit_array.byte_size(payload))
+      |> exor(payload, _)
+  }
 }
 
 fn repeat_mask(mask: BitArray, payload_length: Int) -> BitArray {
-  let mask_length = bit_array.byte_size(mask)
-
-  case payload_length {
-    _ if payload_length <= mask_length ->
+  case bit_array.byte_size(mask) {
+    mask_length if mask_length >= payload_length ->
       bit_array.slice(mask, 0, payload_length)
       |> result.unwrap(<<>>)
-    _ -> {
-      let repeat = payload_length / mask_length
-      let remainder = payload_length % mask_length
-
-      let base = copy(mask, repeat)
-
-      case remainder {
-        0 -> base
-        n -> {
-          let partial = bit_array.slice(mask, 0, n) |> result.unwrap(<<>>)
-          <<base:bits, partial:bits>>
-        }
-      }
-    }
+    _mask_length -> repeat_mask(<<mask:bits, mask:bits>>, payload_length)
   }
 }
 
 @external(erlang, "crypto", "exor")
 fn exor(bin1: BitArray, bin2: BitArray) -> BitArray
-
-@external(erlang, "binary", "copy")
-fn copy(subject: BitArray, n: Int) -> BitArray
 
 // -----------------------------------------------------------------------------
 // Compression
@@ -350,11 +348,12 @@ fn init_deflate(
   strategy: Default,
 ) -> atom.Atom
 
-@external(erlang, "zlib", "inflate")
-fn do_inflate(
+@external(erlang, "websocks_ffi", "inflate_limited")
+fn inflate_limited(
   context: CompressionContext,
   data: BitArray,
-) -> bytes_tree.BytesTree
+  limit: Int,
+) -> Result(BitArray, Nil)
 
 @external(erlang, "zlib", "deflate")
 fn do_deflate(
@@ -428,13 +427,20 @@ fn compress(state: Compression, payload: BitArray) -> BitArray {
   }
 }
 
-fn decompress(state: Compression, payload: BitArray) -> BitArray {
+fn decompress(
+  state: Compression,
+  payload: BitArray,
+  limit: Int,
+) -> Result(BitArray, Nil) {
   case state {
-    Disabled -> payload
+    Disabled -> Ok(payload)
     Enabled(inflate_context:, reset_on_decompress:, ..) -> {
       let decompressed =
-        do_inflate(inflate_context, <<payload:bits, 0x00, 0x00, 0xff, 0xff>>)
-        |> bytes_tree.to_bit_array()
+        inflate_limited(
+          inflate_context,
+          <<payload:bits, 0x00, 0x00, 0xff, 0xff>>,
+          limit,
+        )
 
       case reset_on_decompress {
         True -> {
@@ -464,17 +470,49 @@ fn close_compression(state: Compression) -> Nil {
 // Context
 // -----------------------------------------------------------------------------
 
+/// Caps on how much data a peer can make this endpoint hold at once. Without
+/// them a peer can declare an arbitrarily large frame, or fragment a single
+/// message indefinitely, and exhaust memory.
+///
+pub type Limits {
+  Limits(
+    /// Largest payload a single frame may declare.
+    ///
+    max_frame_size: Int,
+    /// Largest payload a fragmented message may accumulate to.
+    ///
+    max_message_size: Int,
+  )
+}
+
+/// 16 MiB per frame, 64 MiB per reassembled message. Use `with_limits` function
+/// to override the limits.
+///
+pub const default_limits: Limits = Limits(
+  max_frame_size: 16_777_216,
+  max_message_size: 67_108_864,
+)
+
+type Fragmentation {
+  NotFragmented
+  Fragmenting(
+    frame_builder: fn(BitArray) -> Frame,
+    accumulated_payload: List(BitArray),
+    accumulated_size: Int,
+    compressed: Bool,
+  )
+}
+
 /// Context is the internal state of the WebSocket connection. It stores the
 /// remaining bytes from the decoding process, fragment accumulation and
 /// compression states.
 pub opaque type Context {
-  Empty(compression: Compression, buffer: BitArray)
-  Accumulating(
+  Context(
+    role: Role,
+    limits: Limits,
     compression: Compression,
     buffer: BitArray,
-    frame_builder: fn(BitArray) -> Frame,
-    accumulated_payload: BitArray,
-    compressed: Bool,
+    fragmentation: Fragmentation,
   )
 }
 
@@ -498,7 +536,7 @@ pub fn create_context(
   extensions: Option(CompressionExtensions),
   role: Role,
 ) -> Context {
-  case extensions {
+  let compression = case extensions {
     Some(CompressionExtensions(
       client_no_context_takeover:,
       client_max_window_bits:,
@@ -526,10 +564,34 @@ pub fn create_context(
         deflate_window_bits,
         inflate_window_bits,
       )
-      |> Empty(buffer: <<>>)
     }
-    None -> Empty(compression: Disabled, buffer: <<>>)
+    None -> Disabled
   }
+
+  Context(
+    role:,
+    limits: default_limits,
+    compression:,
+    buffer: <<>>,
+    fragmentation: NotFragmented,
+  )
+}
+
+/// Replaces the context's buffering limits. Call before any frames are 
+/// processed.
+///
+/// ### Example
+///
+/// ```gleam
+/// websocks.create_context(None, websocks.Server)
+/// |> websocks.with_limits(websocks.Limits(
+///   max_frame_size: 65_536,
+///   max_message_size: 1_048_576,
+/// ))
+/// ```
+///
+pub fn with_limits(context: Context, limits: Limits) -> Context {
+  Context(..context, limits:)
 }
 
 /// Frees the compression resources. Should be called when the context is no
@@ -547,9 +609,15 @@ pub fn close_context(context: Context) -> Nil {
 }
 
 fn update_buffer(context: Context, data: BitArray) -> Context {
-  case context {
-    Empty(..) -> Empty(..context, buffer: data)
-    Accumulating(..) -> Accumulating(..context, buffer: data)
+  Context(..context, buffer: data)
+}
+
+// Concatenating an empty buffer still copies the whole read, which costs more
+// than decoding a small frame does.
+fn prepend_buffer(context: Context, data: BitArray) -> BitArray {
+  case context.buffer {
+    <<>> -> data
+    buffer -> <<buffer:bits, data:bits>>
   }
 }
 
@@ -563,14 +631,23 @@ fn apply_compression(
   }
 }
 
+fn join_fragments(fragments: List(BitArray)) -> BitArray {
+  fragments
+  |> list.reverse
+  |> bit_array.concat
+}
+
 fn apply_decompression(
   compression: Compression,
   payload: BitArray,
   compressed: Bool,
-) {
+  limit: Int,
+) -> Result(BitArray, ResolveError) {
   case compressed {
-    True -> decompress(compression, payload)
-    False -> payload
+    True ->
+      decompress(compression, payload, limit)
+      |> result.replace_error(DecompressionFailed)
+    False -> Ok(payload)
   }
 }
 
@@ -601,80 +678,130 @@ pub type Control {
   Close(reason: CloseReason)
 }
 
-/// Close reason codes, that can be used in the close control frame.
-pub type CloseReason {
+/// Status codes that may appear in a close frame. 
+/// 
+/// The codes reserved for local use only, such as 1005, 1006 and 1015, are 
+/// absent. They must never be sent, and receiving one is a protocol violation.
+///
+pub type CloseCode {
   /// The connection successfully completed its purpose and is closing normally.
-  NormalClosure(data: BitArray)
+  NormalClosure
   /// The endpoint is going away, either due to server shutdown or browser
   /// navigation.
-  GoingAway(data: BitArray)
+  GoingAway
   /// A WebSocket protocol violation was detected.
-  ProtocolError(data: BitArray)
+  ProtocolError
   /// The endpoint received data it cannot accept.
-  UnsupportedData(data: BitArray)
+  UnsupportedData
   /// The message data doesn’t match the declared type.
-  InvalidPayloadData(data: BitArray)
+  InvalidPayloadData
   /// Generic status for policy violations when no other code applies.
-  PolicyViolation(data: BitArray)
+  PolicyViolation
   /// Message exceeds the maximum size the endpoint can handle.
-  MessageTooBig(data: BitArray)
+  MessageTooBig
   /// The server encountered an unexpected condition preventing request
   /// fulfillment.
-  MandatoryExtension(data: BitArray)
+  MandatoryExtension
   /// The server encountered unexpected error.
-  InternalError(data: BitArray)
+  InternalError
   /// Server is restarting.
-  ServiceRestart(data: BitArray)
+  ServiceRestart
   /// Temporary server overload.
-  TryAgainLater(data: BitArray)
+  TryAgainLater
   /// Gateway/proxy received invalid response.
-  BadGateway(data: BitArray)
-  /// TLS/SSL handshake failure.
-  TLSHandshake(data: BitArray)
-  /// Custom close codes for application-specific use cases.
-  CustomCloseCode(code: Int, data: BitArray)
-  /// No close reason.
-  NoCloseReason
+  BadGateway
+  /// An application-specific code, between 3000 and 4999.
+  ApplicationCode(code: Int)
 }
 
-type InternalFrame {
-  DecodedContinuation(payload: BitArray, compressed: Bool)
-  DecodedText(payload: BitArray, compressed: Bool)
-  DecodedBinary(payload: BitArray, compressed: Bool)
-  DecodedControl(control: Control)
-}
-
-fn internal_frame_to_frame(
-  internal_frame: InternalFrame,
-  compression: Compression,
-) -> Frame {
-  case internal_frame {
-    DecodedContinuation(payload:, compressed:) ->
-      Continuation(payload: apply_decompression(
-        compression,
-        payload,
-        compressed,
-      ))
-
-    DecodedText(payload:, compressed:) ->
-      Text(payload: apply_decompression(compression, payload, compressed))
-
-    DecodedBinary(payload:, compressed:) ->
-      Binary(payload: apply_decompression(compression, payload, compressed))
-
-    DecodedControl(control:) -> Control(control:)
+fn close_code_to_int(code: CloseCode) -> Int {
+  case code {
+    NormalClosure -> 1000
+    GoingAway -> 1001
+    ProtocolError -> 1002
+    UnsupportedData -> 1003
+    InvalidPayloadData -> 1007
+    PolicyViolation -> 1008
+    MessageTooBig -> 1009
+    MandatoryExtension -> 1010
+    InternalError -> 1011
+    ServiceRestart -> 1012
+    TryAgainLater -> 1013
+    BadGateway -> 1014
+    ApplicationCode(code:) -> code
   }
+}
+
+fn close_code_from_int(code: Int) -> Result(CloseCode, Nil) {
+  case code {
+    1000 -> Ok(NormalClosure)
+    1001 -> Ok(GoingAway)
+    1002 -> Ok(ProtocolError)
+    1003 -> Ok(UnsupportedData)
+    1007 -> Ok(InvalidPayloadData)
+    1008 -> Ok(PolicyViolation)
+    1009 -> Ok(MessageTooBig)
+    1010 -> Ok(MandatoryExtension)
+    1011 -> Ok(InternalError)
+    1012 -> Ok(ServiceRestart)
+    1013 -> Ok(TryAgainLater)
+    1014 -> Ok(BadGateway)
+    code if code >= 3000 && code <= 4999 -> Ok(ApplicationCode(code:))
+    _code -> Error(Nil)
+  }
+}
+
+/// Why the connection is closing. Close frame is allowed to carry neither code nor reason.
+///
+pub type CloseReason {
+  /// A close frame with an empty payload.
+  NoCloseReason
+  /// A close frame carrying a status code and an optional description.
+  CloseReason(code: CloseCode, reason: String)
+}
+
+// Three opcodes that may be fragmented.
+type FragmentFrame {
+  ContinuationFragment(payload: BitArray, compressed: Bool)
+  TextFragment(payload: BitArray, compressed: Bool)
+  BinaryFragment(payload: BitArray, compressed: Bool)
+}
+
+// What an opcode denotes, before `fin` decides whether the frame is complete.
+type DecodedPayload {
+  FragmentPayload(fragment: FragmentFrame)
+  ControlPayload(control: Control)
+}
+
+fn fragment_to_frame(
+  fragment: FragmentFrame,
+  compression: Compression,
+  limit: Int,
+) -> Result(Frame, ResolveError) {
+  let #(build, payload, compressed) = case fragment {
+    ContinuationFragment(payload:, compressed:) -> #(
+      Continuation,
+      payload,
+      compressed,
+    )
+    TextFragment(payload:, compressed:) -> #(Text, payload, compressed)
+    BinaryFragment(payload:, compressed:) -> #(Binary, payload, compressed)
+  }
+
+  apply_decompression(compression, payload, compressed, limit)
+  |> result.map(build)
 }
 
 // -----------------------------------------------------------------------------
 // Decoding
 // -----------------------------------------------------------------------------
 
-/// The result of the decoding process. It contains the decoded
-/// complete/incomplete frame with possible compression applied.
+/// The result of decoding one frame off the wire, before fragmentation is
+/// resolved.
+@internal
 pub opaque type DecodedFrame {
-  Complete(InternalFrame)
-  Incomplete(InternalFrame)
+  Complete(FragmentFrame)
+  Incomplete(FragmentFrame)
   Resolved(Frame)
 }
 
@@ -684,39 +811,12 @@ pub type DecodeError {
   InvalidFrame
   /// The data is not enough to decode the frame.
   NotEnoughData(data: BitArray)
+  /// The frame declares a payload larger than the context's `max_frame_size`.
+  FrameTooLarge(length: Int, limit: Int)
 }
 
-/// Decodes a single frame from the given data. For decoding multiple frames
-/// it is recommended to use `decode_many_frames` instead.
-///
-/// ### Example
-///
-/// ```gleam
-/// // 0x81 : fin=1, rsv1-3=0, opcode=1
-/// // 0x05 : mask=0, payload length=5
-/// let frame = <<0x81, 0x05>>
-/// // 0x48 0x65 0x6c 0x6c 0x6f : "Hello"
-/// let payload = <<0x48, 0x65, 0x6c, 0x6c, 0x6f>>
-///
-/// // Let's assume we have this buffer:
-/// let buffer = <<frame:bits, payload:bits, frame:bits>>
-///
-/// // The first frame is decoded, and the remaining binary is returned.
-/// let decoded = websocks.decode_frame(buffer)
-/// // => Ok(#(DecodedFrame, <<129, 5>>))
-///
-/// let assert Ok(#(_decoded_frame, rest)) = decoded
-///
-/// // Remaining binary is not enough to decode the frame.
-/// websocks.decode_frame(rest)
-/// // => Error(NotEnoughData(<<129, 5>>))
-///
-/// // If we add the remaining payload to the buffer, the frame is decoded.
-/// websocks.decode_frame(<<rest:bits, payload:bits>>)
-/// // => Ok(#(DecodedFrame, <<>>))
-/// ```
-///
-pub fn decode_frame(
+// Decodes a single frame from the given data, leaving fragmentation unresolved.
+fn decode_frame(
   data: BitArray,
   context: Context,
 ) -> Result(#(DecodedFrame, BitArray), DecodeError) {
@@ -727,7 +827,7 @@ pub fn decode_frame(
       rsv2:1,
       rsv3:1,
       opcode:size(4),
-      mask:1,
+      masked:1,
       payload_length:size(7),
       rest:bits,
     >> -> {
@@ -735,165 +835,113 @@ pub fn decode_frame(
 
       use _nil <- result.try(case compressed, context.compression {
         True, Disabled(..) -> Error(InvalidFrame)
-        _, _ -> Ok(Nil)
+        _compressed, _compression -> Ok(Nil)
       })
 
       use <- bool.guard(rsv2 == 1 || rsv3 == 1, return: Error(InvalidFrame))
 
-      // Decoding payload length
+      // RSV1 marks a compressed message, so it belongs on the first frame only
+      // and never on a continuation.
+      use <- bool.guard(compressed && opcode == 0, return: Error(InvalidFrame))
 
-      let extended_payload_length = case payload_length {
-        126 -> Some(16)
-        127 -> Some(64)
-        _ -> None
+      // Every client frame is masked and no server frame is.
+      let misdirected_mask = case context.role, masked {
+        Server, 0 -> True
+        Client, 1 -> True
+        _role, _masked -> False
       }
+      use <- bool.guard(misdirected_mask, return: Error(InvalidFrame))
 
-      use #(payload_length, rest) <- result.try(case extended_payload_length {
-        Some(length) ->
+      // Control frames carry at most 125 bytes and are never fragmented. 
+      let control = opcode >= 8
+      use <- bool.guard(
+        control && { payload_length > 125 || fin == 0 },
+        return: Error(InvalidFrame),
+      )
+
+      use #(payload_length, rest) <- result.try(case payload_length {
+        // The length must use the minimal number of bytes.
+        126 ->
           case rest {
-            <<payload_length:size(length), rest:bits>> ->
-              Ok(#(payload_length, rest))
-            _ -> Error(NotEnoughData(data))
+            <<extended:size(16), rest:bits>> if extended > 125 ->
+              Ok(#(extended, rest))
+            <<_extended:size(16), _rest:bits>> -> Error(InvalidFrame)
+            _rest -> Error(NotEnoughData(data))
           }
-        None -> Ok(#(payload_length, rest))
+        // The most significant bit of a 64 bit length must be zero.
+        127 ->
+          case rest {
+            <<0:1, extended:size(63), rest:bits>> if extended > 65_535 ->
+              Ok(#(extended, rest))
+            <<_msb:1, _extended:size(63), _rest:bits>> -> Error(InvalidFrame)
+            _rest -> Error(NotEnoughData(data))
+          }
+        _payload_length -> Ok(#(payload_length, rest))
       })
 
-      // Reading and unmasking the payload
+      // Rejecting before the payload is read keeps the buffer bounded. A peer
+      // cannot make us hold more than one frame's worth of bytes.
+      use <- bool.guard(
+        payload_length > context.limits.max_frame_size,
+        return: Error(FrameTooLarge(
+          length: payload_length,
+          limit: context.limits.max_frame_size,
+        )),
+      )
 
-      use #(payload, rest) <- result.try(case mask, rest {
+      use #(payload, rest) <- result.try(case masked, rest {
         // Masked payload
-        1, <<mask:bytes-size(4), payload:bytes-size(payload_length), rest:bits>>
-        -> {
-          let payload =
-            repeat_mask(mask, payload_length)
-            |> exor(payload, _)
-
-          Ok(#(payload, rest))
-        }
-        1, _ -> Error(NotEnoughData(data))
+        1,
+          <<
+            mask_key:bytes-size(4),
+            payload:bytes-size(payload_length),
+            rest:bits,
+          >>
+        -> Ok(#(mask(payload, mask_key), rest))
+        1, _rest -> Error(NotEnoughData(data))
 
         // Normal payload
         0, <<payload:bytes-size(payload_length), rest:bits>> ->
           Ok(#(payload, rest))
-        0, _ -> Error(NotEnoughData(data))
+        0, _rest -> Error(NotEnoughData(data))
 
-        _, _ -> Error(InvalidFrame)
+        _masked, _rest -> Error(InvalidFrame)
       })
 
-      let frame = case opcode {
-        0 -> Ok(DecodedContinuation(payload:, compressed:))
-        1 -> Ok(DecodedText(payload:, compressed:))
-        2 -> Ok(DecodedBinary(payload:, compressed:))
-        8 -> {
+      use decoded_payload <- result.try(case opcode {
+        0 -> Ok(FragmentPayload(ContinuationFragment(payload:, compressed:)))
+        1 -> Ok(FragmentPayload(TextFragment(payload:, compressed:)))
+        2 -> Ok(FragmentPayload(BinaryFragment(payload:, compressed:)))
+        8 ->
           case payload {
-            <<>> -> Ok(DecodedControl(Close(NoCloseReason)))
+            <<>> -> Ok(ControlPayload(Close(NoCloseReason)))
             <<code:size(16), data:bits>> -> {
-              use <- bool.guard(
-                when: !bit_array.is_utf8(data),
-                return: Error(InvalidFrame),
+              use code <- result.try(
+                close_code_from_int(code) |> result.replace_error(InvalidFrame),
+              )
+              use reason <- result.try(
+                to_string(data) |> result.replace_error(InvalidFrame),
               )
 
-              case code {
-                1000 -> Ok(DecodedControl(Close(NormalClosure(data:))))
-                1001 -> Ok(DecodedControl(Close(GoingAway(data:))))
-                1002 -> Ok(DecodedControl(Close(ProtocolError(data:))))
-                1003 -> Ok(DecodedControl(Close(UnsupportedData(data:))))
-                1007 -> Ok(DecodedControl(Close(InvalidPayloadData(data:))))
-                1008 -> Ok(DecodedControl(Close(PolicyViolation(data:))))
-                1009 -> Ok(DecodedControl(Close(MessageTooBig(data:))))
-                1010 -> Ok(DecodedControl(Close(MandatoryExtension(data:))))
-                1011 -> Ok(DecodedControl(Close(InternalError(data:))))
-                1012 -> Ok(DecodedControl(Close(ServiceRestart(data:))))
-                1013 -> Ok(DecodedControl(Close(TryAgainLater(data:))))
-                1014 -> Ok(DecodedControl(Close(BadGateway(data:))))
-                1015 -> Ok(DecodedControl(Close(TLSHandshake(data:))))
-                code if code >= 3000 && code <= 4999 ->
-                  Ok(DecodedControl(Close(CustomCloseCode(code:, data:))))
-                _ -> Error(InvalidFrame)
-              }
+              Ok(ControlPayload(Close(CloseReason(code:, reason:))))
             }
-            _ -> Error(InvalidFrame)
+            // A one byte payload is neither absent nor a whole status code.
+            _payload -> Error(InvalidFrame)
           }
-        }
-        9 -> Ok(DecodedControl(Ping(payload:)))
-        10 -> Ok(DecodedControl(Pong(payload:)))
-        _ -> Error(InvalidFrame)
-      }
+        9 -> Ok(ControlPayload(Ping(payload:)))
+        10 -> Ok(ControlPayload(Pong(payload:)))
+        _opcode -> Error(InvalidFrame)
+      })
 
-      case fin, frame {
-        1, Ok(DecodedControl(control:)) ->
-          Ok(#(Resolved(Control(control:)), rest))
-        0, Ok(DecodedControl(_)) -> Error(InvalidFrame)
-        1, Ok(frame) -> Ok(#(Complete(frame), rest))
-        0, Ok(frame) -> Ok(#(Incomplete(frame), rest))
-        _, _ -> Error(InvalidFrame)
+      case fin, decoded_payload {
+        1, ControlPayload(control:) -> Ok(#(Resolved(Control(control:)), rest))
+        // Control frames carry no continuation, so they cannot be fragmented.
+        _fin, ControlPayload(..) -> Error(InvalidFrame)
+        1, FragmentPayload(fragment:) -> Ok(#(Complete(fragment), rest))
+        _fin, FragmentPayload(fragment:) -> Ok(#(Incomplete(fragment), rest))
       }
     }
     _ -> Error(NotEnoughData(data))
-  }
-}
-
-/// Decodes multiple frames from the given data until the buffer is empty or an
-/// error occurs. Returns the provided context with updated buffer.
-///
-/// ### Example
-///
-/// ```gleam
-/// // 0x81 : fin=1, rsv1-3=0, opcode=1
-/// // 0x04 : mask=0, payload length=4
-/// let frame = <<0x81, 0x04>>
-/// // 0x48 0x65 0x6c 0x6c : "Hell"
-/// let payload1 = <<0x48, 0x65, 0x6c, 0x6c>>
-/// // 0x6f 0x20 0x57 0x6f : "o Wo"
-/// let payload2 = <<0x6f, 0x20, 0x57, 0x6f>>
-/// // 0x72 0x6c 0x64 0x21 : "rld!"
-/// let payload3 = <<0x72, 0x6c, 0x64, 0x21>>
-///
-/// // Let's assume we have this buffer:
-/// let frames = <<
-///   frame:bits,
-///   payload1:bits,
-///   frame:bits,
-///   payload2:bits,
-///   frame:bits,
-/// >>
-///
-/// // The context is used to store the remaining bytes after decoding.
-/// let context = websocks.create_context(None)
-///
-/// let decoded = websocks.decode_many_frames(frames, context)
-/// // => Ok(#([DecodedFrame, DecodedFrame], Context: <<0x81, 0x04>>))
-///
-/// let assert Ok(#(_decoded_frames, updated_context)) = decoded
-///
-/// // We can try to decode the remaining frames using the updated context.
-/// websocks.decode_many_frames(payload3, updated_context)
-/// // => Ok(#([DecodedFrame], Context: <<>>))
-/// ```
-///
-pub fn decode_many_frames(
-  data: BitArray,
-  context: Context,
-) -> Result(#(List(DecodedFrame), Context), Nil) {
-  do_decode_many_frames(<<context.buffer:bits, data:bits>>, context, [])
-}
-
-fn do_decode_many_frames(
-  data: BitArray,
-  context: Context,
-  decoded_frames: List(DecodedFrame),
-) -> Result(#(List(DecodedFrame), Context), Nil) {
-  case decode_frame(data, context) {
-    Ok(#(decoded_frame, <<>>)) ->
-      Ok(#(
-        list.reverse([decoded_frame, ..decoded_frames]),
-        update_buffer(context, <<>>),
-      ))
-    Ok(#(decoded_frame, rest)) ->
-      do_decode_many_frames(rest, context, [decoded_frame, ..decoded_frames])
-    Error(NotEnoughData(data)) ->
-      Ok(#(list.reverse(decoded_frames), update_buffer(context, data)))
-    Error(InvalidFrame) -> Error(Nil)
   }
 }
 
@@ -916,20 +964,10 @@ fn encode_frame(
     Control(Close(reason)) -> {
       let payload = case reason {
         NoCloseReason -> <<>>
-        NormalClosure(data) -> <<1000:size(16), data:bits>>
-        GoingAway(data) -> <<1001:size(16), data:bits>>
-        ProtocolError(data) -> <<1002:size(16), data:bits>>
-        UnsupportedData(data) -> <<1003:size(16), data:bits>>
-        InvalidPayloadData(data) -> <<1007:size(16), data:bits>>
-        PolicyViolation(data) -> <<1008:size(16), data:bits>>
-        MessageTooBig(data) -> <<1009:size(16), data:bits>>
-        MandatoryExtension(data) -> <<1010:size(16), data:bits>>
-        InternalError(data) -> <<1011:size(16), data:bits>>
-        ServiceRestart(data) -> <<1012:size(16), data:bits>>
-        TryAgainLater(data) -> <<1013:size(16), data:bits>>
-        BadGateway(data) -> <<1014:size(16), data:bits>>
-        TLSHandshake(data) -> <<1015:size(16), data:bits>>
-        CustomCloseCode(code, data) -> <<code:size(16), data:bits>>
+        CloseReason(code:, reason:) -> {
+          let code = close_code_to_int(code)
+          <<code:size(16), reason:utf8>>
+        }
       }
 
       #(8, payload)
@@ -1057,182 +1095,20 @@ pub type ResolveError {
   NotUtf8
   /// Receive continuation frame as the first frame in a fragmentation sequence.
   OrphanedContinuation
-  /// The control frame is fragmented.
-  ControlFrameFragmented
   /// Receive complete text/binary frame when resolving fragmented frame.
   FragmentationInterrupted
   /// Receive incomplete text/binary frame when resolving fragmented frame.
   ConcurrentFragmentation
-  /// The continuation frame contains compressed flag (RSV1=1).
-  CompressedContinuation
+  /// The fragments accumulated past the context's `max_message_size`.
+  MessageTooLarge(size: Int, limit: Int)
+  /// The payload is not a valid deflate stream, or inflating it would exceed
+  /// the context's `max_message_size`.
+  DecompressionFailed
 }
 
-/// Resolves a list of decoded frames into a list of frames. If the context has
-/// compression enabled, the payload will be decompressed. Incomplete frames are
-/// stored in the updated context until the fragmentation is complete. If
-/// returns an error, the protocol is violated, and the implementation should
-/// consider closing the WebSocket connection.
+/// Errors that can occur in `next_frame`. Each means the peer has broken the
+/// protocol and the connection should be closed.
 ///
-/// ### Example
-///
-/// ```gleam
-/// // Incomplete text frame:
-/// // 0x01 : fin=0, rsv1-3=0, opcode=1
-/// // 0x04 : mask=0, payload length=4
-/// let text = <<0x01, 0x04>>
-/// // 0x00 : fin=0, rsv1-3=0, opcode=0
-/// // 0x04 : mask=0, payload length=4
-/// let continuation_complete = <<0x80, 0x04>>
-/// // Complete continuation frame:
-/// // 0x80 : fin=1, rsv1-3=0, opcode=0
-/// // 0x04 : mask=0, payload length=4
-/// let continuation_incomplete = <<0x00, 0x04>>
-/// // 0x48 0x65 0x6c 0x6c : "Hell"
-/// let payload1 = <<0x48, 0x65, 0x6c, 0x6c>>
-/// // 0x6f 0x20 0x57 0x6f : "o Wo"
-/// let payload2 = <<0x6f, 0x20, 0x57, 0x6f>>
-/// // 0x72 0x6c 0x64 0x21 : "rld!"
-/// let payload3 = <<0x72, 0x6c, 0x64, 0x21>>
-///
-/// // Let's assume we have this buffer:
-/// let frames = <<
-///   text:bits,
-///   payload1:bits,
-///   continuation_incomplete:bits,
-///   payload2:bits,
-///   continuation_complete:bits,
-///   payload3:bits,
-/// >>
-///
-/// let context = websocks.create_context(None)
-///
-/// // We assume that the frames have been successfully decoded.
-/// let assert Ok(#(decoded_frames, context)) =
-///   websocks.decode_many_frames(frames, context)
-///
-/// // Resolve the decoded frames.
-/// websocks.resolve_fragments(decoded_frames, context)
-/// // => Ok(#([Text("Hello World!")], Context))
-/// ```
-///
-pub fn resolve_fragments(
-  decoded_frames: List(DecodedFrame),
-  context: Context,
-) -> Result(#(List(Frame), Context), ResolveError) {
-  do_resolve_fragments(decoded_frames, context, [])
-}
-
-fn do_resolve_fragments(
-  decoded_frames: List(DecodedFrame),
-  context: Context,
-  resolved: List(Frame),
-) {
-  case decoded_frames, context {
-    // No more frames to process.
-    [], context -> Ok(#(list.reverse(resolved), context))
-
-    // Text frames must be UTF-8.
-    [Resolved(Text(payload:)), ..rest], context -> {
-      case bit_array.is_utf8(payload) {
-        True ->
-          do_resolve_fragments(rest, context, [Text(payload:), ..resolved])
-        False -> Error(NotUtf8)
-      }
-    }
-    // The rest resolved frame types can be freely added to the resolved list.
-    [Resolved(frame), ..rest], context ->
-      do_resolve_fragments(rest, context, [frame, ..resolved])
-
-    // Continuation frames cannot be the first frame in a fragmentation.
-    [Complete(DecodedContinuation(..)), ..], Empty(..) ->
-      Error(OrphanedContinuation)
-    // Complete frames are considered resolved if there is no fragmentation
-    // happening.
-    [Complete(frame), ..rest], Empty(..) as context -> {
-      let frame = Resolved(internal_frame_to_frame(frame, context.compression))
-      do_resolve_fragments([frame, ..rest], context, resolved)
-    }
-
-    // Incomplete text frame begins fragmentation of text frame.
-    [Incomplete(DecodedText(payload:, compressed:)), ..rest],
-      Empty(compression:, buffer:)
-    ->
-      do_resolve_fragments(
-        rest,
-        Accumulating(Text, payload, compressed:, compression:, buffer:),
-        resolved,
-      )
-    // Incomplete binary frame begins fragmentation of binary frame.
-    [Incomplete(DecodedBinary(payload:, compressed:)), ..rest],
-      Empty(compression:, buffer:)
-    ->
-      do_resolve_fragments(
-        rest,
-        Accumulating(Binary, payload, compressed:, compression:, buffer:),
-        resolved,
-      )
-    // Continuation frames cannot be the first frame in a fragmentation.
-    [Incomplete(DecodedContinuation(..)), ..], Empty(..) ->
-      Error(OrphanedContinuation)
-    // Control frames cannot be fragmented.
-    [Incomplete(..), ..], Empty(..) -> Error(ControlFrameFragmented)
-
-    // Incomplete continuation frame continues fragmentation.
-    [Incomplete(DecodedContinuation(payload:, compressed:)), ..rest],
-      Accumulating(accumulated_payload:, ..) as context
-    -> {
-      use <- bool.guard(compressed, return: Error(CompressedContinuation))
-
-      do_resolve_fragments(
-        rest,
-        Accumulating(..context, accumulated_payload: <<
-          accumulated_payload:bits,
-          payload:bits,
-        >>),
-        resolved,
-      )
-    }
-    // Incomplete frames cannot be fragmented concurrently.
-    [Incomplete(..), ..], Accumulating(..) -> Error(ConcurrentFragmentation)
-
-    // Complete continuation frame completes fragmentation.
-    [Complete(DecodedContinuation(payload:, compressed:)), ..rest],
-      Accumulating(..) as context
-    -> {
-      use <- bool.guard(compressed, return: Error(CompressedContinuation))
-
-      let payload =
-        apply_decompression(
-          context.compression,
-          <<context.accumulated_payload:bits, payload:bits>>,
-          context.compressed,
-        )
-
-      do_resolve_fragments(
-        [Resolved(context.frame_builder(payload)), ..rest],
-        Empty(context.compression, context.buffer),
-        resolved,
-      )
-    }
-
-    // Received complete frame when fragmentation is happening.
-    [Complete(..), ..], Accumulating(..) -> Error(FragmentationInterrupted)
-  }
-}
-
-/// Represents an instruction, indicating whether to continue processing
-/// more frames or stop. Used by the frame handler in `process_incoming_frames`
-/// to control the processing flow.
-pub type ResolveNext(state) {
-  /// Continue processing more frames with the updated state.
-  Continue(state: state)
-  /// Stop processing frames and return the updated state. Remaining data will
-  /// be stored in the context buffer for the next processing call.
-  Stop(state: state)
-}
-
-/// Errors that can occur during the frame processing in
-/// `process_incoming_frames`.
 pub type ProcessError {
   /// Frame decoding failed with the given decode error.
   DecodeFailed(reason: DecodeError)
@@ -1240,12 +1116,27 @@ pub type ProcessError {
   ResolveFailed(reason: ResolveError)
 }
 
-/// Processes incoming WebSocket frames from the given data. This function
-/// combines the context buffer with the new data, decodes frames, resolves
-/// fragments, and calls the handler function for each resolved frame. The
-/// handler returns `ResolveNext` to control the processing flow. If there's not
-/// enough data to decode a complete frame, the remaining data is stored in the
-/// context buffer for the next call.
+/// The outcome of decoding one frame with `next_frame`.
+///
+pub type Decoded {
+  /// The buffer holds no further complete frame. Its leftover bytes are kept in
+  /// the returned context, to be joined with the next read.
+  ///
+  MoreData(context: Context)
+  /// A frame, with fragmentation reassembled and compression applied.
+  ///
+  Decoded(frame: Frame, context: Context)
+}
+
+/// Adds a read to the context's buffer, ready to be drained by `next_frame`.
+///
+pub fn push_data(context: Context, data: BitArray) -> Context {
+  update_buffer(context, prepend_buffer(context, data))
+}
+
+/// Decodes the next frame from the context's buffer, resolving fragmentation and
+/// decompression. Fragments are consumed internally, so `MoreData` always means
+/// the connection needs another read rather than another call.
 ///
 /// ### Example
 ///
@@ -1256,174 +1147,158 @@ pub type ProcessError {
 /// // 0x48 0x65 0x6c 0x6c 0x6f : "Hello"
 /// let payload = <<0x48, 0x65, 0x6c, 0x6c, 0x6f>>
 ///
-/// // let's assume we have this buffer:
-/// let data = <<frame:bits, payload:bits, frame:bits>>
+/// let context =
+///   websocks.create_context(None, websocks.Client)
+///   |> websocks.push_data(<<frame:bits, payload:bits, frame:bits>>)
 ///
-/// let context = websocks.create_context(None)
-/// let initial_state = 0
+/// let assert Ok(websocks.Decoded(frame:, context:)) =
+///   websocks.next_frame(context)
+/// // frame => Text(<<"Hello">>)
 ///
-/// // Handler that collects all text frames
-/// let handler = fn(state, _context, frame) {
-///   case frame {
-///     websocks.Continuation(payload) ->
-///       echo #("received continuation frame", payload)
-///     websocks.Text(payload) -> echo #("received text frame", payload)
-///     websocks.Binary(payload) -> echo #("received binary frame", payload)
-///     websocks.Control(websocks.Ping(payload)) ->
-///       echo #("received ping frame", payload)
-///     websocks.Control(websocks.Pong(payload)) ->
-///       echo #("received pong frame", payload)
-///     websocks.Control(websocks.Close(reason)) ->
-///       echo #(
-///         "received close frame",
-///         bit_array.from_string(string.inspect(reason)),
-///       )
-///   }
-///
-///   websocks.Continue(state + 1)
-/// }
-///
-/// let processed =
-///   websocks.process_incoming_frames(data, context, initial_state, handler)
-///   // => #("received text frame", "Hello")
-///
-/// echo processed
-/// // => Ok(#(1, context: <<0x81, 0x05>>))
+/// // The trailing header alone is not a whole frame, so it stays buffered.
+/// websocks.next_frame(context)
+/// // => Ok(MoreData(context))
 /// ```
 ///
-pub fn process_incoming_frames(
-  data: BitArray,
-  context: Context,
-  state: state,
-  handler: fn(state, Context, Frame) -> ResolveNext(state),
-) {
-  let data = <<context.buffer:bits, data:bits>>
-  do_process_incoming_frames(data, context, state, handler)
-}
+pub fn next_frame(context: Context) -> Result(Decoded, ProcessError) {
+  case decode_frame(context.buffer, context) {
+    Error(NotEnoughData(remaining)) ->
+      Ok(MoreData(update_buffer(context, remaining)))
+    Error(error) -> Error(DecodeFailed(error))
 
-fn do_process_incoming_frames(
-  data: BitArray,
-  context: Context,
-  state: state,
-  handler: fn(state, Context, Frame) -> ResolveNext(state),
-) {
-  case decode_frame(data, context) {
     Ok(#(decoded_frame, rest)) -> {
-      let result =
-        resolve_and_handle_single_frame(decoded_frame, context, state, handler)
-      case result {
-        Ok(#(Continue(new_state), new_context)) ->
-          case rest {
-            <<>> -> Ok(#(new_state, update_buffer(new_context, <<>>)))
-            _ ->
-              do_process_incoming_frames(rest, new_context, new_state, handler)
-          }
-        Ok(#(Stop(new_state), new_context)) ->
-          Ok(#(new_state, update_buffer(new_context, rest)))
-        Error(e) -> Error(ResolveFailed(e))
+      let context = update_buffer(context, rest)
+
+      case resolve_frame(decoded_frame, context) {
+        Error(error) -> Error(ResolveFailed(error))
+        Ok(#(Some(frame), context)) -> Ok(Decoded(frame:, context:))
+        // A fragment carries no message on its own, so keep draining rather
+        // than handing the caller a `MoreData` it cannot act on.
+        Ok(#(None, context)) -> next_frame(context)
       }
     }
-    Error(NotEnoughData(remaining)) ->
-      Ok(#(state, update_buffer(context, remaining)))
-    Error(e) -> Error(DecodeFailed(e))
   }
 }
 
-fn resolve_and_handle_single_frame(
+fn resolve_frame(
   decoded_frame: DecodedFrame,
   context: Context,
-  state: state,
-  handler: fn(state, Context, Frame) -> ResolveNext(state),
-) {
-  case decoded_frame, context {
-    Resolved(Text(payload:)), context ->
-      case bit_array.is_utf8(payload) {
-        True -> Ok(#(handler(state, context, Text(payload:)), context))
+) -> Result(#(Option(Frame), Context), ResolveError) {
+  case decoded_frame, context.fragmentation {
+    Resolved(Text(payload:)), _fragmentation ->
+      case is_utf8(payload) {
+        True -> Ok(#(Some(Text(payload:)), context))
         False -> Error(NotUtf8)
       }
 
-    Resolved(frame), context -> Ok(#(handler(state, context, frame), context))
+    Resolved(frame), _fragmentation -> Ok(#(Some(frame), context))
 
-    Complete(DecodedContinuation(..)), Empty(..) -> Error(OrphanedContinuation)
-
-    Complete(frame), Empty(..) as context ->
-      internal_frame_to_frame(frame, context.compression)
-      |> Resolved
-      |> resolve_and_handle_single_frame(context, state, handler)
-
-    Incomplete(DecodedText(payload:, compressed:)), Empty(compression:, buffer:)
-    ->
-      Ok(#(
-        Continue(state),
-        Accumulating(Text, payload, compressed:, compression:, buffer:),
-      ))
-
-    Incomplete(DecodedBinary(payload:, compressed:)),
-      Empty(compression:, buffer:)
-    -> {
-      Ok(#(
-        Continue(state),
-        Accumulating(Binary, payload, compressed:, compression:, buffer:),
-      ))
-    }
-
-    Incomplete(DecodedContinuation(..)), Empty(..) ->
+    Complete(ContinuationFragment(..)), NotFragmented ->
       Error(OrphanedContinuation)
 
-    Incomplete(DecodedControl(..)), Empty(..) ->
-      panic as "Incomplete(DecodedControl(..)) is not allowed"
+    Complete(fragment), NotFragmented -> {
+      use frame <- result.try(fragment_to_frame(
+        fragment,
+        context.compression,
+        context.limits.max_message_size,
+      ))
 
-    Incomplete(DecodedContinuation(payload:, compressed:)),
-      Accumulating(accumulated_payload:, ..) as context
+      resolve_frame(Resolved(frame), context)
+    }
+
+    Incomplete(TextFragment(payload:, compressed:)), NotFragmented ->
+      begin_fragmentation(context, Text, payload, compressed)
+
+    Incomplete(BinaryFragment(payload:, compressed:)), NotFragmented ->
+      begin_fragmentation(context, Binary, payload, compressed)
+
+    Incomplete(ContinuationFragment(..)), NotFragmented ->
+      Error(OrphanedContinuation)
+
+    Incomplete(ContinuationFragment(payload:, ..)),
+      Fragmenting(accumulated_payload:, accumulated_size:, ..) as fragmenting
     -> {
-      case compressed {
-        // TODO: handle this in decode_frame function?
-        True -> Error(CompressedContinuation)
-        False ->
-          Ok(#(
-            Continue(state),
-            Accumulating(..context, accumulated_payload: <<
-              accumulated_payload:bits,
-              payload:bits,
-            >>),
-          ))
-      }
+      let accumulated_size = accumulated_size + bit_array.byte_size(payload)
+      use _nil <- result.try(check_message_size(context, accumulated_size))
+
+      Ok(#(
+        None,
+        Context(
+          ..context,
+          fragmentation: Fragmenting(
+            ..fragmenting,
+            accumulated_payload: [payload, ..accumulated_payload],
+            accumulated_size:,
+          ),
+        ),
+      ))
     }
 
     // Incomplete frames cannot be fragmented concurrently.
-    Incomplete(..), Accumulating(..) -> Error(ConcurrentFragmentation)
+    Incomplete(..), Fragmenting(..) -> Error(ConcurrentFragmentation)
 
     // Complete continuation completes fragmentation
-    Complete(DecodedContinuation(payload:, compressed:)),
-      Accumulating(..) as context
+    Complete(ContinuationFragment(payload:, ..)),
+      Fragmenting(
+        frame_builder:,
+        accumulated_payload:,
+        accumulated_size:,
+        compressed:,
+      )
     -> {
-      case compressed {
-        // TODO: handle this in decode_frame function?
-        True -> Error(CompressedContinuation)
-        False -> {
-          let complete_payload =
-            apply_decompression(
-              context.compression,
-              <<context.accumulated_payload:bits, payload:bits>>,
-              context.compressed,
-            )
+      let accumulated_size = accumulated_size + bit_array.byte_size(payload)
+      use _nil <- result.try(check_message_size(context, accumulated_size))
 
-          let frame = context.frame_builder(complete_payload)
-          let new_context = Empty(context.compression, context.buffer)
+      use complete_payload <- result.try(apply_decompression(
+        context.compression,
+        join_fragments([payload, ..accumulated_payload]),
+        compressed,
+        context.limits.max_message_size,
+      ))
 
-          resolve_and_handle_single_frame(
-            Resolved(frame),
-            new_context,
-            state,
-            handler,
-          )
-        }
-      }
+      resolve_frame(
+        Resolved(frame_builder(complete_payload)),
+        Context(..context, fragmentation: NotFragmented),
+      )
     }
 
     // Received complete frame when fragmentation is happening.
-    Complete(..), Accumulating(..) -> Error(FragmentationInterrupted)
+    Complete(..), Fragmenting(..) -> Error(FragmentationInterrupted)
   }
+}
+
+fn check_message_size(
+  context: Context,
+  size: Int,
+) -> Result(Nil, ResolveError) {
+  case size > context.limits.max_message_size {
+    True ->
+      Error(MessageTooLarge(size:, limit: context.limits.max_message_size))
+    False -> Ok(Nil)
+  }
+}
+
+fn begin_fragmentation(
+  context: Context,
+  frame_builder: fn(BitArray) -> Frame,
+  payload: BitArray,
+  compressed: Bool,
+) -> Result(#(Option(Frame), Context), ResolveError) {
+  let accumulated_size = bit_array.byte_size(payload)
+  use _nil <- result.try(check_message_size(context, accumulated_size))
+
+  Ok(#(
+    None,
+    Context(
+      ..context,
+      fragmentation: Fragmenting(
+        frame_builder:,
+        accumulated_payload: [payload],
+        accumulated_size:,
+        compressed:,
+      ),
+    ),
+  ))
 }
 
 // -----------------------------------------------------------------------------
@@ -1435,9 +1310,11 @@ fn resolve_and_handle_single_frame(
 @internal
 pub fn extract_accumulating_frame(context: Context) -> Result(Frame, Nil) {
   case context {
-    Accumulating(frame_builder:, accumulated_payload:, ..) ->
-      Ok(frame_builder(accumulated_payload))
-    Empty(..) -> Error(Nil)
+    Context(
+      fragmentation: Fragmenting(frame_builder:, accumulated_payload:, ..),
+      ..,
+    ) -> Ok(frame_builder(join_fragments(accumulated_payload)))
+    Context(fragmentation: NotFragmented, ..) -> Error(Nil)
   }
 }
 
@@ -1449,35 +1326,8 @@ pub fn extract_buffer(context: Context) -> BitArray {
 @internal
 pub fn is_empty_context(context: Context) -> Bool {
   case context {
-    Empty(..) -> True
-    Accumulating(..) -> False
-  }
-}
-
-@internal
-pub fn to_decoded_frame(
-  frame: Frame,
-  final final: Bool,
-  compressed compressed: Bool,
-) -> DecodedFrame {
-  case frame {
-    Continuation(payload:) ->
-      DecodedContinuation(payload:, compressed:)
-      |> wrap_decoded_frame(final)
-    Text(payload:) ->
-      DecodedText(payload:, compressed:)
-      |> wrap_decoded_frame(final)
-    Binary(payload:) ->
-      DecodedBinary(payload:, compressed:)
-      |> wrap_decoded_frame(final)
-    Control(control:) -> Resolved(Control(control:))
-  }
-}
-
-fn wrap_decoded_frame(internal: InternalFrame, final: Bool) -> DecodedFrame {
-  case final {
-    True -> Complete(internal)
-    False -> Incomplete(internal)
+    Context(fragmentation: NotFragmented, ..) -> True
+    Context(fragmentation: Fragmenting(..), ..) -> False
   }
 }
 
