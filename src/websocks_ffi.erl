@@ -2,9 +2,6 @@
 
 -export([is_utf8/1, to_string/1, inflate_limited/3]).
 
-%% Gleam strings are UTF-8 binaries on Erlang, so validating a payload is all the
-%% conversion a valid one needs. `bit_array.to_string` would re-validate through
-%% the stdlib's per-codepoint loop.
 to_string(Payload) ->
     case is_utf8(Payload) of
         true -> {ok, Payload};
@@ -12,20 +9,37 @@ to_string(Payload) ->
     end.
 
 is_utf8(Payload) when is_binary(Payload) ->
-    unicode:bin_is_7bit(Payload)
-        orelse is_binary(unicode:characters_to_binary(Payload, utf8, utf8));
+    case skip_ascii(Payload) of
+        <<>> -> true;
+        Rest -> is_binary(unicode:characters_to_binary(Rest, utf8))
+    end;
 is_utf8(_Payload) ->
     false.
 
-%% `zlib:inflate/2` decompresses in one shot with no cap, so a small frame can
-%% expand into an arbitrarily large binary. `zlib:safeInflate/2` yields chunk by
-%% chunk instead, letting the running total be checked against `Limit` and the
-%% work abandoned as soon as it is exceeded.
+-define(HIGH_BITS, 16#80808080808080).
+
+skip_ascii(<<A:56, B:56, C:56, D:56, Rest/binary>>) when
+    A band ?HIGH_BITS =:= 0,
+    B band ?HIGH_BITS =:= 0,
+    C band ?HIGH_BITS =:= 0,
+    D band ?HIGH_BITS =:= 0
+->
+    skip_ascii(Rest);
+skip_ascii(<<Word:56, Rest/binary>>) when Word band ?HIGH_BITS =:= 0 ->
+    skip_ascii(Rest);
+skip_ascii(<<Word:48>>) when Word band 16#808080808080 =:= 0 -> <<>>;
+skip_ascii(<<Word:40>>) when Word band 16#8080808080 =:= 0 -> <<>>;
+skip_ascii(<<Word:32>>) when Word band 16#80808080 =:= 0 -> <<>>;
+skip_ascii(<<Word:24>>) when Word band 16#808080 =:= 0 -> <<>>;
+skip_ascii(<<Word:16>>) when Word band 16#8080 =:= 0 -> <<>>;
+skip_ascii(<<Word:8>>) when Word band 16#80 =:= 0 -> <<>>;
+skip_ascii(Rest) ->
+    Rest.
+
 inflate_limited(Context, Data, Limit) ->
     try
         inflate_loop(zlib:safeInflate(Context, Data), Context, Limit, 0, [])
     catch
-        %% malformed deflate stream
         error:_Reason -> {error, nil}
     end.
 

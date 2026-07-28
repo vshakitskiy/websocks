@@ -1,5 +1,9 @@
 # Changelog
 
+## 4.0.1 - 29.07.26
+
+- Change the UTF-8 validation logic replacing `unicode:bin_is_7bit`
+
 ## 4.0.0 - 27.07.26
 
 - Replace `process_incoming_frames` with `push_data` and `next_frame`, which return frames instead of taking a handler
